@@ -256,30 +256,42 @@ Just chat with me naturally - I understand context!`
         }
 
         // 2. If waiting for edit instruction
-        if (userState[remoteJid]?.waitingForEdit) {
-            const repoPath = userState[remoteJid].repoPath
-            const janitoCmd = `cd ${repoPath} && janito describe`
+        if (textContent.startsWith('/vibe ')) {
+            const user = userState[remoteJid];
+            if (!user?.repoPath) {
+                await sock.sendMessage(remoteJid, { text: "No repo found for this conversation. Please /clone first." });
+                return;
+            }
 
-            // Notify user
-            const notifyResponse = "Applying changes with AI. Please wait..."
-            await sock.sendMessage(remoteJid, { text: notifyResponse })
-            addToHistory(remoteJid, 'assistant', notifyResponse)
+            const repoPath = user.repoPath;
+            const promptForJanito = textContent.replace('/vibe', '').trim();
 
+            if (!promptForJanito) {
+                await sock.sendMessage(remoteJid, { text: "Please provide a prompt, e.g., /vibe Change the title to Hello World." });
+                return;
+            }
+
+            logger.info(`Running janito for prompt: ${promptForJanito} on ${repoPath}`)
+
+            await sock.sendMessage(remoteJid, { text: "Applying your change with Janito, please wait..." });
+
+            const janitoCmd = `cd ${repoPath} && janito "${promptForJanito.replace(/"/g, '\\"')}"`;
+            logger.info(`Running: ${janitoCmd}`)
             exec(janitoCmd, async (err, stdout, stderr) => {
-                if (err) {
-                    const response = `Error applying changes: ${stderr || err}`
-                    await sock.sendMessage(remoteJid, { text: response })
-                    addToHistory(remoteJid, 'assistant', response)
-                } else {
-                    // After change, update state
-                    userState[remoteJid].waitingForEdit = false
-                    userState[remoteJid].waitingForCommit = true
-                    const response = "Changes done! Do you want me to commit? (yes/no)"
-                    await sock.sendMessage(remoteJid, { text: response })
-                    addToHistory(remoteJid, 'assistant', response)
-                }
-            })
-            return
+                logger.info('Janito /vibe result', { err, stdout, stderr })
+                let msg = '';
+                if (err) msg += `❌ Janito error:\n${err}\n\n`;
+                if (stderr) msg += `⚠️ STDERR:\n${stderr}\n\n`;
+                if (stdout) msg += `✅ STDOUT:\n${stdout}\n\n`;
+                if (!msg) msg = 'No output from Janito.';
+
+                userState[remoteJid].waitingForCommit = true;
+
+                await sock.sendMessage(remoteJid, { 
+                    text: `Changes done!\n\n${msg}\nDo you want me to commit? (yes/no)` 
+                });
+            });
+            return;
         }
 
         // 3. If waiting for commit confirmation
