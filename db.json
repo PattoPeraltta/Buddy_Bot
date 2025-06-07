@@ -2,9 +2,10 @@
   "users": [
     {
       "phone": "5491132986313@s.whatsapp.net",
-      "tokenEnc": "f5e0d2f4aac4c5562ac4a9c1bf0b1bb1:9104d753e10fc61585bb29068ab7f3b0a26e84d941b3f6531353161f0a042f19ba32aed14b446ddc6ceb6d05cf83473c71b05de8a40cedbc1071864e0c577eb669af09810b346256c7a36df02afadd04c58d21a571db316eed87d19e08bce47d",
+      "tokenEnc": "ddefe4c0c789d4923aac1192e5555c7a:a7fe4078d49482a5734e4e53390d9ea00c130eb8c70fe863cbc1a5c7e91f588c5f89c03a0de24350f74365685d75ee372f125f85aedf4ca4beccad216f8a86922778a0bc04144f94d3683a35a131e8bc474dd6fb6f7fc42af6fc3c5e7e4ce0dc",
       "createdAt": "2025-06-07T16:49:55.506Z",
-      "activeRepoId": 5
+      "activeRepoId": 7,
+      "vercelTokenEnc": "20dd440ee2b1e581500a0403953c8f67:e0aae2b37bb65253d3eb76cf60e3b9ed95ff1fede897d8a85f788c9d354e855b"
     },
     {
       "phone": "5493764177993@s.whatsapp.net",
@@ -69,7 +70,14 @@
       "repoUrl": "https://github.com/LIA-DiTella/visdecode.git",
       "localPath": "./repos/1749318579398",
       "createdAt": "2025-06-07T17:49:58.839Z"
+    },
+    {
+      "id": 7,
+      "phone": "5491132986313@s.whatsapp.net",
+      "repoUrl": "https://github.com/santi-nihany/certo.git",
+      "localPath": "./repos/1749324153165",
+      "createdAt": "2025-06-07T19:22:34.886Z"
     }
   ],
-  "nextRepoId": 7
+  "nextRepoId": 8
 }

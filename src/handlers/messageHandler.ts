@@ -5,10 +5,22 @@ import { generateResponse, chatWithRepoFunctions } from '../ai/openai.js'
 import { createLogger } from '../logger/index.js'
 
 import simpleGit from 'simple-git'
-import { exec } from 'child_process'
-import { saveToken, addRepo, listRepos, getToken, setActiveRepo, getActiveRepo } from '../db/index.js'
+import { exec, execSync } from 'child_process'
+import { saveToken, addRepo, listRepos, getToken, setActiveRepo, getActiveRepo, saveVercelToken, getVercelToken } from '../db/index.js'
 import { fetchUserRepos, formatRepoList, findRepoByName } from '../utils/github.js'
 import { handleAudioMessage } from './audioHandler.js'
+import { 
+    isVercelCliInstalled, 
+    deployToVercel, 
+    getVercelStatus, 
+    getVercelLogs,
+    detectProjectType,
+    generateVercelJson,
+    validateVercelToken,
+    testVercelToken
+} from '../utils/vercel.js'
+import fs from 'fs'
+import path from 'path'
 
 const logger = createLogger('MessageHandler')
 const userState = {}
@@ -106,8 +118,8 @@ async function handleMessage(sock: WASocket, message: WAMessage) {
         const remoteJid = message.key.remoteJid
         if (!remoteJid) return
 
-        // Handle audio messages first
-        if (message.message?.audioMessage || message.message?.voiceMessage) {
+        // Handle audio messages
+        if (message.message?.audioMessage) {
             await handleAudioMessage(sock, message)
             return
         }
@@ -163,6 +175,13 @@ I can help you manage GitHub repositories via WhatsApp!
 • \`/vibe <prompt>\` - Edit code with AI (e.g., /vibe add login form)
 • \`/status\` - Show current repo and git status
 • \`/current\` or \`/active\` - Show current active repository
+• \`/deploy\` - Deploy current repo to Vercel 🚀
+• \`/deploy-preview\` - Deploy as preview (staging)
+• \`/vercel-status\` - Check Vercel deployment status
+• \`/vercel-auth\` - Authenticate with Vercel CLI
+• \`/vercel-token <token>\` - Save Vercel authentication token
+• \`/vercel-test\` - Test your stored Vercel token
+• \`/vercel-logs\` - Get deployment logs
 • \`/help\` - Show this help
 
 *What I can do:*
@@ -175,13 +194,15 @@ I can help you manage GitHub repositories via WhatsApp!
 ✅ Generate intelligent commit messages
 ✅ Prevent duplicate cloning
 ✅ Track git status and changes
+✅ Deploy to Vercel with one command! 🌐
 
 *Getting started:*
 1. Send me your GitHub token or use \`/auth <token>\`
 2. Use \`/repos\` to see your repositories
 3. Say "clone X repo" or use \`/clone <url>\`
 4. Use \`/vibe <what you want>\` to edit code
-5. Commit with intelligent messages! 
+5. Use \`/vercel-token <token>\` to save your Vercel token
+6. Use \`/deploy\` to deploy to Vercel!
 
 Just chat with me naturally - I understand context!`
             await sock.sendMessage(remoteJid, { text: response })
@@ -213,6 +234,62 @@ Just chat with me naturally - I understand context!`
                 await sock.sendMessage(remoteJid, { text: response })
                 addToHistory(remoteJid, 'assistant', response)
             }
+            return
+        }
+
+        // Save Vercel token
+        if (textContent.startsWith('/vercel-token ')) {
+            const token = textContent.split(' ')[1]?.trim()
+            if (!token) {
+                const response = '🔐 Usage: /vercel-token <your_vercel_token>\n\nGet your Vercel token from:\n1. Visit https://vercel.com/account/tokens\n2. Create a new token\n3. Copy and use with this command'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+            } else {
+                // Validate token format first
+                if (!validateVercelToken(token)) {
+                    const response = '❌ Invalid token format!\n\nVercel tokens should be:\n• 20+ characters long\n• No spaces or line breaks\n• Complete token (not truncated)\n\nPlease get a fresh token from https://vercel.com/account/tokens'
+                    await sock.sendMessage(remoteJid, { text: response })
+                    addToHistory(remoteJid, 'assistant', response)
+                    return
+                }
+                
+                // Test the token
+                await sock.sendMessage(remoteJid, { text: '🔍 Testing token...' })
+                
+                const testResult = await testVercelToken(token)
+                if (testResult.valid) {
+                    saveVercelToken(remoteJid, token)
+                    const response = `✅ Vercel token saved and verified!\n\n${testResult.message}\n\nYou can now use /deploy or /deploy-preview to deploy your projects.`
+                    await sock.sendMessage(remoteJid, { text: response })
+                    addToHistory(remoteJid, 'assistant', response)
+                } else {
+                    const response = `❌ Token validation failed!\n\n${testResult.message}\n\nPlease:\n1. Get a fresh token from https://vercel.com/account/tokens\n2. Make sure you copy the complete token\n3. Ensure the token has proper permissions`
+                    await sock.sendMessage(remoteJid, { text: response })
+                    addToHistory(remoteJid, 'assistant', response)
+                }
+            }
+            return
+        }
+
+        // Test stored Vercel token
+        if (textContent.startsWith('/vercel-test')) {
+            const storedToken = getVercelToken(remoteJid)
+            if (!storedToken) {
+                const response = '❌ No Vercel token found!\n\nUse `/vercel-token <your_token>` to save one first.'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+            
+            await sock.sendMessage(remoteJid, { text: '🔍 Testing stored token...' })
+            
+            const testResult = await testVercelToken(storedToken)
+            const response = testResult.valid 
+                ? `✅ Token is valid!\n\n${testResult.message}`
+                : `❌ Stored token is invalid!\n\n${testResult.message}\n\nUse \`/vercel-token <new_token>\` to update it.`
+            
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
             return
         }
 
@@ -430,31 +507,42 @@ Just chat with me naturally - I understand context!`
 
         // 3. If waiting for commit confirmation
         if (userState[remoteJid]?.waitingForCommit) {
-            if (/^(yes|commit)/i.test(textContent.trim())) {
-                const repoPath = userState[remoteJid].repoPath
-                const lastPrompt = userState[remoteJid].lastPrompt || 'AI-generated changes'
-                const git = simpleGit(repoPath)
-                await git.add('.')
-                
-                // Generate intelligent commit message
-                const commitMessage = await generateCommitMessage(repoPath, lastPrompt)
-                logger.info('Generated commit message', { commitMessage, prompt: lastPrompt })
-                await git.commit(commitMessage)
-                
-                // Push if we have a stored token
+            const { repoPath, lastPrompt } = userState[remoteJid]
+            const git = simpleGit(repoPath)
+
+            if (textContent.toLowerCase().includes('yes') || textContent.toLowerCase().includes('y')) {
+                // Auto-generate commit message with AI
+                const commitMessage = `AI: ${lastPrompt}`
+
                 try {
+                    await git.add('.')
+                    await git.commit(commitMessage)
+
+                    // Get GitHub token and push if available
                     const token = getToken(remoteJid)
                     if (token) {
-                        const originUrlRes = await git.remote(['get-url', 'origin'])
-                        const originUrl = (originUrlRes ?? '').toString().trim()
-                        const tokenUrl = originUrl.replace('https://', `https://${token}@`)
-                        await git.remote(['set-url', 'origin', tokenUrl])
-                        await git.push('origin', 'HEAD')
-                        // Restore original URL without the token for safety
-                        await git.remote(['set-url', 'origin', originUrl])
+                        const remotes = await git.getRemotes(true)
+                        const originUrl = remotes.find(r => r.name === 'origin')?.refs?.fetch
+                        if (originUrl) {
+                            const tokenUrl = originUrl.replace('https://', `https://${token}@`)
+                            await git.remote(['set-url', 'origin', tokenUrl])
+                            await git.push('origin', 'HEAD')
+                            // Restore original URL without the token for safety
+                            await git.remote(['set-url', 'origin', originUrl])
+                        }
                         const response = `✅ Changes committed and pushed to GitHub!\n\nCommit: ${commitMessage} 🚀`
                         await sock.sendMessage(remoteJid, { text: response })
                         addToHistory(remoteJid, 'assistant', response)
+                        
+                        // Ask if they want to deploy to Vercel
+                        if (isVercelCliInstalled()) {
+                            const deployPrompt = '🚀 Would you like to deploy to Vercel? Reply with "deploy" or "yes" to proceed.'
+                            await sock.sendMessage(remoteJid, { text: deployPrompt })
+                            addToHistory(remoteJid, 'assistant', deployPrompt)
+                            
+                            // Set a flag to handle the next message as a deploy confirmation
+                            userState[remoteJid].waitingForDeployConfirm = true
+                        }
                     } else {
                         const response = `✅ Changes committed locally!\n\nCommit: ${commitMessage}\n\nConfigure a GitHub token with /auth to enable pushing.`
                         await sock.sendMessage(remoteJid, { text: response })
@@ -473,6 +561,32 @@ Just chat with me naturally - I understand context!`
                 await sock.sendMessage(remoteJid, { text: response })
                 addToHistory(remoteJid, 'assistant', response)
             }
+            return
+        }
+
+        // 4. If waiting for deploy confirmation
+        if (userState[remoteJid]?.waitingForDeployConfirm) {
+            const activeRepo = getActiveRepo(remoteJid)
+            
+            if (textContent.toLowerCase().includes('deploy') || textContent.toLowerCase().includes('yes') || textContent.toLowerCase().includes('y')) {
+                if (activeRepo) {
+                    await sock.sendMessage(remoteJid, { text: '🚀 Starting Vercel deployment...' })
+                    
+                    const result = await deployToVercel(activeRepo.localPath, true)
+                    await sock.sendMessage(remoteJid, { text: result.message })
+                    addToHistory(remoteJid, 'assistant', result.message)
+                } else {
+                    const response = '❌ No active repository found for deployment.'
+                    await sock.sendMessage(remoteJid, { text: response })
+                    addToHistory(remoteJid, 'assistant', response)
+                }
+            } else {
+                const response = 'Deployment skipped. You can deploy later using /deploy command.'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+            }
+            
+            userState[remoteJid].waitingForDeployConfirm = false
             return
         }
 
@@ -607,6 +721,213 @@ Just chat with me naturally - I understand context!`
                     return
                 }
             }
+        }
+
+        // Vercel authentication command
+        if (textContent.startsWith('/vercel-auth')) {
+            const response = '🔐 **Vercel Authentication Guide**\n\nTo deploy to Vercel via WhatsApp:\n\n**Step 1:** Get your token\n• Visit https://vercel.com/account/tokens\n• Click "Create Token"\n• Give it a name (e.g., "WhatsApp Bot")\n• Copy the complete token\n\n**Step 2:** Send it to me\n• Type: `/vercel-token <your_token>`\n• I\'ll validate and store it securely\n\n**Step 3:** Deploy!\n• Use `/deploy` for production\n• Use `/deploy-preview` for staging\n\n💡 Your token stays encrypted and is only used for your deployments!'
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
+            return
+        }
+
+        // Vercel deployment command
+        if (textContent.startsWith('/deploy')) {
+            const activeRepo = getActiveRepo(remoteJid)
+            if (!activeRepo) {
+                const response = '❌ No active repository. Use /repos to list or /clone to add repositories.'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+
+            const repoPath = activeRepo.localPath
+
+            // Check if Vercel CLI is installed
+            if (!isVercelCliInstalled()) {
+                const response = '⚠️ Vercel CLI not found!\n\nPlease install it first:\n```npm install -g vercel```\n\nThen use /vercel-token to save your token.'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+
+            // Detect project type and optionally generate vercel.json
+            const projectType = detectProjectType(repoPath)
+            if (projectType) {
+                const generated = generateVercelJson(repoPath, projectType)
+                if (generated) {
+                    const infoMsg = `📝 Detected ${projectType} project - generated vercel.json`
+                    await sock.sendMessage(remoteJid, { text: infoMsg })
+                }
+            }
+
+            await sock.sendMessage(remoteJid, { text: '🚀 **Starting Deployment...**\n\n⏱️ This might take 2-5 minutes for larger projects.' })
+            addToHistory(remoteJid, 'assistant', '🚀 Starting Vercel deployment...')
+
+            // Get stored Vercel token
+            const vercelToken = getVercelToken(remoteJid)
+
+            // Send progress update after 1 minute
+            setTimeout(async () => {
+                await sock.sendMessage(remoteJid, { text: '⏳ **Still Building...**\n\nVercel is compiling your project.' })
+            }, 60000)
+
+            // Deploy to Vercel using utility function with token
+            try {
+                const result = await deployToVercel(repoPath, true, vercelToken || undefined)
+                await sock.sendMessage(remoteJid, { text: result.message })
+                addToHistory(remoteJid, 'assistant', result.message)
+            } catch (error) {
+                const errorMsg = `❌ Deployment error: ${error}\n\nTry using /vercel-status to check if it deployed anyway.`
+                await sock.sendMessage(remoteJid, { text: errorMsg })
+                addToHistory(remoteJid, 'assistant', errorMsg)
+            }
+            
+            return
+        }
+
+        // Vercel status command
+        if (textContent.startsWith('/vercel-status')) {
+            const activeRepo = getActiveRepo(remoteJid)
+            if (!activeRepo) {
+                const response = '❌ No active repository. Use /repos to list or /clone to add repositories.'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+
+            const repoPath = activeRepo.localPath
+
+            // Check if Vercel CLI is installed
+            if (!isVercelCliInstalled()) {
+                const response = '⚠️ Vercel CLI not found! Install with: `npm install -g vercel`'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+
+            await sock.sendMessage(remoteJid, { text: '🔍 Checking Vercel deployment status...' })
+
+            // Get stored Vercel token
+            const vercelToken = getVercelToken(remoteJid)
+
+            // Check deployment status using utility function with token
+            const result = await getVercelStatus(repoPath, vercelToken || undefined)
+            await sock.sendMessage(remoteJid, { text: result.message })
+            addToHistory(remoteJid, 'assistant', result.message)
+            
+            return
+        }
+
+        // Vercel logs command
+        if (textContent.startsWith('/vercel-logs')) {
+            const activeRepo = getActiveRepo(remoteJid)
+            if (!activeRepo) {
+                const response = '❌ No active repository. Use /repos to list or /clone to add repositories.'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+
+            const repoPath = activeRepo.localPath
+
+            // Check if Vercel CLI is installed
+            if (!isVercelCliInstalled()) {
+                const response = '⚠️ Vercel CLI not found! Install with: `npm install -g vercel`'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+
+            await sock.sendMessage(remoteJid, { text: '📜 Fetching deployment logs...' })
+
+            // Get stored Vercel token
+            const vercelToken = getVercelToken(remoteJid)
+
+            // Get deployment logs using utility function with token
+            const result = await getVercelLogs(repoPath, 50, vercelToken || undefined)
+            await sock.sendMessage(remoteJid, { text: result.message })
+            addToHistory(remoteJid, 'assistant', result.message)
+            
+            return
+        }
+
+        // Vercel preview deployment command
+        if (textContent.startsWith('/deploy-preview')) {
+            const activeRepo = getActiveRepo(remoteJid)
+            if (!activeRepo) {
+                const response = '❌ No active repository. Use /repos to list or /clone to add repositories.'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+
+            const repoPath = activeRepo.localPath
+
+            // Check if Vercel CLI is installed
+            if (!isVercelCliInstalled()) {
+                const response = '⚠️ Vercel CLI not found!\n\nPlease install it first:\n```npm install -g vercel```\n\nThen use /vercel-token to save your token.'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+
+            // Detect project type and optionally generate vercel.json
+            const projectType = detectProjectType(repoPath)
+            if (projectType) {
+                const generated = generateVercelJson(repoPath, projectType)
+                if (generated) {
+                    const infoMsg = `📝 Detected ${projectType} project - generated vercel.json`
+                    await sock.sendMessage(remoteJid, { text: infoMsg })
+                }
+            }
+
+            await sock.sendMessage(remoteJid, { text: '🔧 Starting preview deployment...' })
+            addToHistory(remoteJid, 'assistant', '🔧 Starting preview deployment...')
+
+            // Get stored Vercel token
+            const vercelToken = getVercelToken(remoteJid)
+
+            // Deploy to Vercel as preview (not production) with token
+            const result = await deployToVercel(repoPath, false, vercelToken || undefined)
+            await sock.sendMessage(remoteJid, { text: result.message })
+            addToHistory(remoteJid, 'assistant', result.message)
+            
+            return
+        }
+
+        // Debug command for deployment troubleshooting
+        if (textContent.startsWith('/debug-deploy')) {
+            const activeRepo = getActiveRepo(remoteJid)
+            if (!activeRepo) {
+                const response = '❌ No active repository set.'
+                await sock.sendMessage(remoteJid, { text: response })
+                return
+            }
+
+            const repoPath = activeRepo.localPath
+            const hasVercelToken = !!getVercelToken(remoteJid)
+            const hasVercelCli = isVercelCliInstalled()
+            
+            // Check if it's a valid project
+            const projectType = detectProjectType(repoPath)
+            
+            // Check if .vercel directory exists
+            const fs = await import('fs')
+            const path = await import('path')
+            const vercelDir = path.join(repoPath, '.vercel')
+            const hasVercelDir = fs.existsSync(vercelDir)
+            
+            let debugInfo = `🔍 **Deployment Debug**\n\n`
+            debugInfo += `📁 **Repo:** ${activeRepo.repoUrl.split('/').pop()?.replace('.git', '')}\n`
+            debugInfo += `🔑 **Token:** ${hasVercelToken ? '✅' : '❌'}\n`
+            debugInfo += `⚙️ **CLI:** ${hasVercelCli ? '✅' : '❌'}\n`
+            debugInfo += `🎯 **Type:** ${projectType || 'Unknown'}\n`
+            debugInfo += `📋 **Config:** ${hasVercelDir ? '✅' : '❌'}`
+            
+            await sock.sendMessage(remoteJid, { text: debugInfo })
+            addToHistory(remoteJid, 'assistant', debugInfo)
+            return
         }
 
         // AI fallback or echo
