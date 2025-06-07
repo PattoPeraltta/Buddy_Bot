@@ -8,6 +8,7 @@ import simpleGit from 'simple-git'
 import { exec } from 'child_process'
 import { saveToken, addRepo, listRepos, getToken, setActiveRepo, getActiveRepo } from '../db/index.js'
 import { fetchUserRepos, formatRepoList, findRepoByName } from '../utils/github.js'
+import { handleAudioMessage } from './audioHandler.js'
 
 const logger = createLogger('MessageHandler')
 const userState = {}
@@ -104,6 +105,12 @@ async function handleMessage(sock: WASocket, message: WAMessage) {
     try {
         const remoteJid = message.key.remoteJid
         if (!remoteJid) return
+
+        // Handle audio messages first
+        if (message.message?.audioMessage || message.message?.voiceMessage) {
+            await handleAudioMessage(sock, message)
+            return
+        }
 
         const textContent =
             message.message?.conversation || message.message?.extendedTextMessage?.text || ''
@@ -639,9 +646,6 @@ Just chat with me naturally - I understand context!`
             addToHistory(remoteJid, 'assistant', response)
         }
     } catch (error) {
-        logger.error('Error handling message', error, {
-            messageId: message.key.id,
-            from: message.key.remoteJid
-        })
+        logger.error('Error handling message', { error })
     }
 }
