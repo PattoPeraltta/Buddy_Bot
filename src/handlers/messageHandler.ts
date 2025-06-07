@@ -272,25 +272,86 @@ Just chat with me naturally - I understand context!`
             }
 
             logger.info(`Running janito for prompt: ${promptForJanito} on ${repoPath}`)
-
-            await sock.sendMessage(remoteJid, { text: "Applying your change with Janito, please wait..." });
+            await sock.sendMessage(remoteJid, { text: "🔄 Starting Janito process..." });
 
             const janitoCmd = `cd ${repoPath} && janito "${promptForJanito.replace(/"/g, '\\"')}"`;
             logger.info(`Running: ${janitoCmd}`)
-            exec(janitoCmd, async (err, stdout, stderr) => {
-                logger.info('Janito /vibe result', { err, stdout, stderr })
-                let msg = '';
-                if (err) msg += `❌ Janito error:\n${err}\n\n`;
-                if (stderr) msg += `⚠️ STDERR:\n${stderr}\n\n`;
-                if (stdout) msg += `✅ STDOUT:\n${stdout}\n\n`;
-                if (!msg) msg = 'No output from Janito.';
 
-                userState[remoteJid].waitingForCommit = true;
+            // Create a child process with stdio set to pipe
+            const { spawn } = require('child_process');
+            const [cmd, ...args] = janitoCmd.split(' ');
+            const janitoProcess = spawn(cmd, args, { shell: true });
 
-                await sock.sendMessage(remoteJid, { 
-                    text: `Changes done!\n\n${msg}\nDo you want me to commit? (yes/no)` 
-                });
+            let currentSection = '';
+            let buffer = '';
+
+            // Handle stdout data
+            janitoProcess.stdout.on('data', async (data) => {
+                const output = data.toString();
+                buffer += output;
+
+                // Check for section headers
+                const sections = ['Implementation plan:', 'Discovery:', 'Description:', 'Implementation:', 'Validation:'];
+                for (const section of sections) {
+                    if (output.includes(section)) {
+                        // If we have buffered content from previous section, send it
+                        if (buffer && currentSection) {
+                            await sock.sendMessage(remoteJid, { 
+                                text: `📝 *${currentSection}*\n${buffer.trim()}`
+                            });
+                            buffer = '';
+                        }
+                        currentSection = section;
+                        break;
+                    }
+                }
+
+                // If we have a complete line, send it
+                if (buffer.includes('\n')) {
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || ''; // Keep the last incomplete line in buffer
+                    
+                    for (const line of lines) {
+                        if (line.trim()) {
+                            await sock.sendMessage(remoteJid, { 
+                                text: `📝 *${currentSection || 'Progress'}*\n${line.trim()}`
+                            });
+                        }
+                    }
+                }
             });
+
+            // Handle stderr data
+            janitoProcess.stderr.on('data', async (data) => {
+                const error = data.toString();
+                if (error.trim()) {
+                    await sock.sendMessage(remoteJid, { 
+                        text: `⚠️ *Error*\n${error.trim()}`
+                    });
+                }
+            });
+
+            // Handle process completion
+            janitoProcess.on('close', async (code) => {
+                // Send any remaining buffered content
+                if (buffer.trim()) {
+                    await sock.sendMessage(remoteJid, { 
+                        text: `📝 *${currentSection || 'Final Output'}*\n${buffer.trim()}`
+                    });
+                }
+
+                if (code === 0) {
+                    userState[remoteJid].waitingForCommit = true;
+                    await sock.sendMessage(remoteJid, { 
+                        text: "✅ Janito process completed!\n\nDo you want me to commit these changes? (yes/no)"
+                    });
+                } else {
+                    await sock.sendMessage(remoteJid, { 
+                        text: `❌ Janito process exited with code ${code}`
+                    });
+                }
+            });
+
             return;
         }
 
