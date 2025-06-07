@@ -1,7 +1,7 @@
 import { BaileysEventMap, WASocket, WAMessage } from 'baileys'
 
 import { config } from '../config/index.js'
-import { generateResponse, chatWithRepoFunctions } from '../ai/openai.js'
+import { generateResponse, chatWithRepoFunctions, synthesizeProgressMessage } from '../ai/openai.js'
 import { createLogger } from '../logger/index.js'
 
 import simpleGit from 'simple-git'
@@ -23,15 +23,17 @@ import fs from 'fs'
 import path from 'path'
 
 const logger = createLogger('MessageHandler')
-const userState = {}
 
-// Conversation history per user
-const conversationHistory: { [key: string]: Array<{ role: 'user' | 'assistant', content: string, timestamp: Date }> } = {}
+// Conversation history per user - exported for sharing with audioHandler
+export const conversationHistory: { [key: string]: Array<{ role: 'user' | 'assistant', content: string, timestamp: Date }> } = {}
 
-// Temporary GitHub repos cache for context
-const githubReposCache: { [key: string]: any[] } = {}
+// Temporary GitHub repos cache for context - exported for sharing with audioHandler
+export const githubReposCache: { [key: string]: any[] } = {}
 
-function addToHistory(userJid: string, role: 'user' | 'assistant', content: string) {
+// User state for commit waiting - exported for sharing with audioHandler  
+export const userState = {}
+
+export function addToHistory(userJid: string, role: 'user' | 'assistant', content: string) {
     if (!conversationHistory[userJid]) {
         conversationHistory[userJid] = []
     }
@@ -88,6 +90,156 @@ async function generateCommitMessage(repoPath: string, userPrompt: string): Prom
     })
 }
 
+async function runJanitoWithProgress(
+    sock: WASocket, 
+    remoteJid: string, 
+    repoPath: string, 
+    prompt: string
+): Promise<{ success: boolean, output: string, hasChanges: boolean }> {
+    return new Promise((resolve) => {
+        logger.info(`Running janito with progress: ${prompt} on ${repoPath}`)
+        
+        // Use spawn with shell command to properly quote the janito prompt
+        const janitoProcess = spawn('sh', ['-c', `janito "${prompt}"`], {
+            cwd: repoPath,
+            stdio: ['pipe', 'pipe', 'pipe']
+        })
+
+        let output = ''
+        let errorOutput = ''
+        
+        // Collect all output without sending progress messages
+        janitoProcess.stdout.on('data', (data) => {
+            output += data.toString()
+        })
+
+        janitoProcess.stderr.on('data', (data) => {
+            errorOutput += data.toString()
+        })
+
+        // Handle process completion
+        janitoProcess.on('close', async (code) => {
+            logger.info('Janito process finished', { code, outputLength: output.length, errorLength: errorOutput.length })
+            
+            const success = code === 0
+            let hasChanges = false
+            
+            if (success && output.trim()) {
+                // Generate 3 different progress messages from the complete output
+                try {
+                    const messages = await generateProgressMessages(output)
+                    
+                    // Send messages with random delays
+                    for (let i = 0; i < messages.length; i++) {
+                        if (i > 0) {
+                            // Random delay between 500ms and 2000ms
+                            const delay = Math.random() * 1500 + 500
+                            await new Promise(resolve => setTimeout(resolve, delay))
+                        }
+                        await sock.sendMessage(remoteJid, { text: messages[i] })
+                    }
+                } catch (error) {
+                    logger.error('Error generating progress messages:', error)
+                }
+                
+                // Check if there are actual git changes
+                exec('git status --porcelain', { cwd: repoPath }, (gitErr, gitStdout) => {
+                    if (!gitErr) {
+                        hasChanges = gitStdout.trim().length > 0
+                        logger.info('Git changes check', { hasChanges, statusOutput: gitStdout.trim() })
+                    } else {
+                        logger.error('Error checking git status:', gitErr)
+                        hasChanges = true // Assume changes if we can't check
+                    }
+                    
+                    resolve({
+                        success,
+                        output: output || '',
+                        hasChanges
+                    })
+                })
+                return
+            }
+            
+            const fullOutput = success ? output : errorOutput || output
+            
+            resolve({
+                success,
+                output: fullOutput,
+                hasChanges
+            })
+        })
+
+        // Handle process errors
+        janitoProcess.on('error', (error) => {
+            logger.error('Janito process error:', error)
+            resolve({
+                success: false,
+                output: `Process error: ${error.message}`,
+                hasChanges: false
+            })
+        })
+    })
+}
+
+// New function to generate 3 different progress messages
+async function generateProgressMessages(janitoOutput: string): Promise<string[]> {
+    const messages: string[] = []
+    
+    // Split output into chunks for different perspectives
+    const lines = janitoOutput.split('\n').filter(line => line.trim().length > 0)
+    const totalLines = lines.length
+    
+    if (totalLines === 0) return ['🤖 Processing your request...']
+    
+    // Generate 3 different messages focusing on different parts/aspects
+    const chunk1 = lines.slice(0, Math.ceil(totalLines / 3)).join('\n')
+    const chunk2 = lines.slice(Math.ceil(totalLines / 3), Math.ceil(2 * totalLines / 3)).join('\n')
+    const chunk3 = lines.slice(Math.ceil(2 * totalLines / 3)).join('\n')
+    
+    try {
+        // Message 1: Early progress
+        if (chunk1.trim()) {
+            const msg1 = await synthesizeProgressMessage([chunk1], 'janito_progress')
+            messages.push(`🚀 ${msg1}`)
+        }
+        
+        // Message 2: Mid progress
+        if (chunk2.trim()) {
+            const msg2 = await synthesizeProgressMessage([chunk2], 'janito_progress')
+            messages.push(`⚡ ${msg2}`)
+        }
+        
+        // Message 3: Final progress
+        if (chunk3.trim()) {
+            const msg3 = await synthesizeProgressMessage([chunk3], 'janito_progress')
+            messages.push(`✅ ${msg3}`)
+        }
+        
+        // If we don't have 3 messages, generate them from the full output with different prompts
+        if (messages.length < 3) {
+            const fullMessage = await synthesizeProgressMessage([janitoOutput], 'janito_progress')
+            
+            if (messages.length === 0) {
+                messages.push(`🔧 Starting: ${fullMessage}`)
+                messages.push(`⚡ Processing: ${fullMessage}`)
+                messages.push(`✅ Completed: ${fullMessage}`)
+            } else if (messages.length === 1) {
+                messages.push(`⚡ Continuing: ${fullMessage}`)
+                messages.push(`✅ Finished: ${fullMessage}`)
+            } else if (messages.length === 2) {
+                messages.push(`✅ Done: ${fullMessage}`)
+            }
+        }
+        
+    } catch (error) {
+        logger.error('Error generating progress messages:', error)
+        return ['🤖 Working on your request...', '⚡ Making progress...', '✅ Almost done...']
+    }
+    
+    return messages.slice(0, 3) // Ensure we only return 3 messages
+}
+
 export function setupMessageHandler(sock: WASocket) {
     // Handle incoming messages
     sock.ev.on(
@@ -117,8 +269,6 @@ async function handleMessage(sock: WASocket, message: WAMessage) {
     try {
         const remoteJid = message.key.remoteJid
         if (!remoteJid) return
-
-        // Handle audio messages
         if (message.message?.audioMessage) {
             await handleAudioMessage(sock, message)
             return
@@ -138,12 +288,23 @@ async function handleMessage(sock: WASocket, message: WAMessage) {
         // Allow only debug phone numbers
         const senderJid = message.key.participant || remoteJid
         const phone = normalizePhone(senderJid.split('@')[0])
-        logger.info('Phone check', { senderJid, phone, allowedPhones: config.allowedPhones })
+        logger.info('Phone check detailed', { 
+            senderJid, 
+            remoteJid,
+            participant: message.key.participant,
+            phoneRaw: senderJid.split('@')[0],
+            phone, 
+            allowedPhones: config.allowedPhones,
+            allowedPhonesLength: config.allowedPhones.length,
+            includes: config.allowedPhones.includes(phone),
+            allowedPhonesType: typeof config.allowedPhones,
+            phoneType: typeof phone
+        })
         if (!config.allowedPhones.includes(phone)) {
-            logger.info('Phone not allowed, ignoring message')
+            logger.info('Phone not allowed, ignoring message', { phone, allowedPhones: config.allowedPhones })
             return
         }
-        logger.info('Phone allowed, processing message')
+        logger.info('Phone allowed, processing message', { phone })
 
         // Add user message to history
         addToHistory(remoteJid, 'user', textContent)
@@ -440,21 +601,36 @@ Just chat with me naturally - I understand context!`
                 .then(async () => {
                     // Save repo association in DB
                     addRepo(remoteJid, repoUrl, localPath)
-                    // Index with janito
+                    // Index with janito and synthesize description
                     exec(`cd ${localPath} && janito describe`, async (err, stdout, stderr) => {
                         if (err) {
-                            const response = `Repo cloned but failed to describe repo: ${stderr || err}`
+                            const response = `Repo cloned but couldn't analyze it: ${stderr || err}`
                             await sock.sendMessage(remoteJid, { text: response })
                             addToHistory(remoteJid, 'assistant', response)
                         } else {
-                            // Build the rich message
-                            const janitoDesc = stdout && stdout.trim().length > 0
-                                ? stdout.trim().substring(0, 2500) // Optional: limit length for WhatsApp
-                                : "(No description provided by Janito)"
-                            const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repository'
-                            const response = `✅ ${repoName} cloned and set as active!\n\n${janitoDesc}\n\nUse "/vibe <description>" to edit or "/status" to see git status.`
-                            await sock.sendMessage(remoteJid, { text: response })
-                            addToHistory(remoteJid, 'assistant', response)
+                            try {
+                                // Synthesize the janito describe output
+                                const rawDescription = stdout && stdout.trim().length > 0 
+                                    ? stdout.trim() 
+                                    : "Repository cloned successfully"
+                                
+                                const synthesizedDesc = await synthesizeProgressMessage([rawDescription], 'janito_describe')
+                                const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repository'
+                                const response = `${repoName} is ready!\n\n${synthesizedDesc}\n\nTry "/vibe <task>" to start editing!`
+                                
+                                await sock.sendMessage(remoteJid, { text: response })
+                                addToHistory(remoteJid, 'assistant', response)
+                            } catch (error) {
+                                logger.error('Error synthesizing description:', error)
+                                // Fallback to original description
+                                const janitoDesc = stdout && stdout.trim().length > 0
+                                    ? stdout.trim().substring(0, 1000)
+                                    : "Repository ready to use"
+                                const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repository'
+                                const response = `${repoName} cloned and ready!\n\n${janitoDesc}\n\nUse "/vibe <task>" to edit!`
+                                await sock.sendMessage(remoteJid, { text: response })
+                                addToHistory(remoteJid, 'assistant', response)
+                            }
                         }
                     })
                 })
@@ -483,24 +659,61 @@ Just chat with me naturally - I understand context!`
             }
 
             logger.info(`Running janito for prompt: ${promptForJanito} on ${repoPath}`)
-            await sock.sendMessage(remoteJid, { text: "🔄 Starting Janito process..." });
+            await sock.sendMessage(remoteJid, { text: "Starting AI code editing..." })
 
-            const janitoCmd = `cd ${repoPath} && janito "${promptForJanito.replace(/"/g, '\\"')}"`;
-            logger.info(`Running: ${janitoCmd}`)
-            exec(janitoCmd, async (err, stdout, stderr) => {
-                logger.info('Janito /vibe result', { err, stdout, stderr })
-                let msg = '';
-                if (err) msg += `❌ Janito error:\n${err}\n\n`;
-                if (stderr) msg += `⚠️ STDERR:\n${stderr}\n\n`;
-                if (stdout) msg += `✅ STDOUT:\n${stdout}\n\n`;
-                if (!msg) msg = 'No output from Janito.';
-
-                userState[remoteJid] = { repoPath, waitingForCommit: true, lastPrompt: promptForJanito }
-
-                await sock.sendMessage(remoteJid, { 
-                    text: `Changes done!\n\n${msg}\nDo you want me to commit? (yes/no)` 
-                });
-            });
+            try {
+                const result = await runJanitoWithProgress(sock, remoteJid, repoPath, promptForJanito)
+                
+                if (result.success) {
+                    if (result.hasChanges) {
+                        userState[remoteJid] = { repoPath, waitingForCommit: true, lastPrompt: promptForJanito }
+                        
+                        const funnyCommitMessages = [
+                            `Done! Want me to commit this masterpiece?`,
+                            `All set! Should I save this work to git?`,
+                            `Task completed! Ready to commit these changes?`,
+                            `Boom! Code is ready. Commit time?`,
+                            `Mission accomplished! Shall we make it official with a commit?`
+                        ]
+                        const randomMessage = funnyCommitMessages[Math.floor(Math.random() * funnyCommitMessages.length)]
+                        
+                        await sock.sendMessage(remoteJid, { 
+                            text: `✅ AI editing completed!\n\n${randomMessage} (yes/no)` 
+                        })
+                        addToHistory(remoteJid, 'assistant', `✅ AI editing completed!\n\n${randomMessage} (yes/no)`)
+                    } else {
+                        const noChangesMessages = [
+                            `Hmm, looks like everything was already perfect! No changes needed.`,
+                            `I checked the code but didn't find anything to change. You're all good!`,
+                            `Your code is already on point! Nothing to modify here.`,
+                            `Seems like the task was already done. No changes required!`,
+                            `Everything looks great as it is. No modifications needed.`
+                        ]
+                        const randomNoChangeMessage = noChangesMessages[Math.floor(Math.random() * noChangesMessages.length)]
+                        
+                        await sock.sendMessage(remoteJid, { text: `${randomNoChangeMessage}` })
+                        addToHistory(remoteJid, 'assistant', `${randomNoChangeMessage}`)
+                    }
+                } else {
+                    const errorMessages = [
+                        `Oops, ran into some trouble:`,
+                        `Hit a snag while working on that:`,
+                        `Something went wrong on my end:`,
+                        `Encountered an issue:`,
+                        `Had some difficulty with that request:`
+                    ]
+                    const randomErrorMessage = errorMessages[Math.floor(Math.random() * errorMessages.length)]
+                    
+                    const response = `❌ AI editing failed:\n\n${result.output}`
+                    await sock.sendMessage(remoteJid, { text: response })
+                    addToHistory(remoteJid, 'assistant', response)
+                }
+            } catch (error) {
+                logger.error('Error running janito with progress:', error)
+                const response = `❌ Error during AI editing: ${error}`
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+            }
 
             return;
         }
@@ -551,22 +764,35 @@ Just chat with me naturally - I understand context!`
                             userState[remoteJid].waitingForDeployConfirm = true
                         }
                     } else {
-                        const response = `✅ Changes committed locally!\n\nCommit: ${commitMessage}\n\nConfigure a GitHub token with /auth to enable pushing.`
-                        await sock.sendMessage(remoteJid, { text: response })
-                        addToHistory(remoteJid, 'assistant', response)
+                        const localMessages = [
+                            `Committed locally: "${commitMessage}"\n\nSet up a GitHub token with /auth to push!`,
+                            `Saved your work: "${commitMessage}"\n\nAdd a token to push to GitHub.`,
+                            `Changes committed: "${commitMessage}"\n\nNeed a GitHub token to push this live.`
+                        ]
+                        const randomLocal = localMessages[Math.floor(Math.random() * localMessages.length)]
+                        
+                        await sock.sendMessage(remoteJid, { text: randomLocal })
+                        addToHistory(remoteJid, 'assistant', randomLocal)
                     }
                 } catch (pushErr) {
                     logger.error('Git push failed', pushErr)
-                    const response = `✅ Committed: ${commitMessage}\n\n❌ Push failed: ${pushErr}`
+                    const response = `Committed: "${commitMessage}"\n\nBut couldn't push - ${pushErr}`
                     await sock.sendMessage(remoteJid, { text: response })
                     addToHistory(remoteJid, 'assistant', response)
                 }
                 userState[remoteJid].waitingForCommit = false
             } else {
                 userState[remoteJid].waitingForCommit = false
-                const response = "Changes not committed. You can send another instruction or /commit later."
-                await sock.sendMessage(remoteJid, { text: response })
-                addToHistory(remoteJid, 'assistant', response)
+                const cancelMessages = [
+                    "No worries! Your changes are still there if you change your mind.",
+                    "Got it, keeping the changes uncommitted for now.",
+                    "Fair enough! The code's ready when you are.",
+                    "Okay, leaving things as they are for now."
+                ]
+                const randomCancel = cancelMessages[Math.floor(Math.random() * cancelMessages.length)]
+                
+                await sock.sendMessage(remoteJid, { text: randomCancel })
+                addToHistory(remoteJid, 'assistant', randomCancel)
             }
             return
         }
@@ -687,7 +913,7 @@ Just chat with me naturally - I understand context!`
                         const repoId = Date.now()
                         const localPath = `./repos/${repoId}`
                         
-                        const startResponse = `🔄 Cloning ${foundRepo.name} (${foundRepo.clone_url})...`
+                        const startResponse = `Cloning ${foundRepo.name}...`
                         await sock.sendMessage(remoteJid, { text: startResponse })
                         addToHistory(remoteJid, 'assistant', startResponse)
 
@@ -696,40 +922,52 @@ Just chat with me naturally - I understand context!`
                                 addRepo(remoteJid, foundRepo.clone_url, localPath)
                                 exec(`cd ${localPath} && janito describe`, async (err, stdout, stderr) => {
                                     if (err) {
-                                        const response = `Repo cloned but failed to describe repo: ${stderr || err}`
+                                        const response = `Repo cloned but couldn't analyze it: ${stderr || err}`
                                         await sock.sendMessage(remoteJid, { text: response })
                                         addToHistory(remoteJid, 'assistant', response)
                                     } else {
-                                        const janitoDesc = stdout && stdout.trim().length > 0
-                                            ? stdout.trim().substring(0, 2500)
-                                            : "(No description provided by Janito)"
-                                        const response = `✅ ${foundRepo.name} cloned and set as active!\n\n${janitoDesc}\n\nUse "/vibe <description>" to edit or "/status" to see git status.`
-                                        await sock.sendMessage(remoteJid, { text: response })
-                                        addToHistory(remoteJid, 'assistant', response)
+                                        try {
+                                            const rawDescription = stdout && stdout.trim().length > 0 
+                                                ? stdout.trim() 
+                                                : "Repository cloned successfully"
+                                            
+                                            const synthesizedDesc = await synthesizeProgressMessage([rawDescription], 'janito_describe')
+                                            const response = `${foundRepo.name} is ready!\n\n${synthesizedDesc}\n\nTry "/vibe <task>" to start editing!`
+                                            
+                                            await sock.sendMessage(remoteJid, { text: response })
+                                            addToHistory(remoteJid, 'assistant', response)
+                                        } catch (error) {
+                                            logger.error('Error synthesizing description:', error)
+                                            const janitoDesc = stdout && stdout.trim().length > 0
+                                                ? stdout.trim().substring(0, 1000)
+                                                : "Repository ready to use"
+                                            const response = `${foundRepo.name} cloned and ready!\n\n${janitoDesc}\n\nUse "/vibe <task>" to edit!`
+                                            await sock.sendMessage(remoteJid, { text: response })
+                                            addToHistory(remoteJid, 'assistant', response)
+                                        }
                                     }
                                 })
                             })
                             .catch(async (err) => {
-                                const response = `❌ Failed to clone ${foundRepo.name}: ${err}`
+                                const response = `Failed to clone ${foundRepo.name}: ${err}`
                                 await sock.sendMessage(remoteJid, { text: response })
                                 addToHistory(remoteJid, 'assistant', response)
                             })
                         return
                     } else {
-                        const response = `❌ Repository "${repoName}" not found in your GitHub repos.\n\nUse /repos to see available repositories.`
+                        const response = `Repository "${repoName}" not found in your GitHub repos.\n\nUse /repos to see available repositories.`
                         await sock.sendMessage(remoteJid, { text: response })
                         addToHistory(remoteJid, 'assistant', response)
                         return
                     }
                 } else {
-                    const response = `❌ No GitHub repositories cached. Use /repos first to load your repositories.`
+                    const response = `No GitHub repositories cached. Use /repos first to load your repositories.`
                     await sock.sendMessage(remoteJid, { text: response })
                     addToHistory(remoteJid, 'assistant', response)
                     return
                 }
             }
         }
-
         // Vercel authentication command
         if (textContent.startsWith('/vercel-auth')) {
             const response = '🔐 **Vercel Authentication Guide**\n\nTo deploy to Vercel via WhatsApp:\n\n**Step 1:** Get your token\n• Visit https://vercel.com/account/tokens\n• Click "Create Token"\n• Give it a name (e.g., "WhatsApp Bot")\n• Copy the complete token\n\n**Step 2:** Send it to me\n• Type: `/vercel-token <your_token>`\n• I\'ll validate and store it securely\n\n**Step 3:** Deploy!\n• Use `/deploy` for production\n• Use `/deploy-preview` for staging\n\n💡 Your token stays encrypted and is only used for your deployments!'
@@ -937,29 +1175,21 @@ Just chat with me naturally - I understand context!`
             return
         }
 
-        // AI fallback or echo
         try {
             logger.info('Entering AI fallback', { textContent, aiEnabled: config.bot.aiEnabled })
             if (config.bot.aiEnabled) {
                 const history = conversationHistory[remoteJid] || []
                 const cachedGithubRepos = githubReposCache[remoteJid] || []
-                logger.info('AI context', { 
-                    historyLength: history.length, 
-                    cachedReposCount: cachedGithubRepos.length,
-                    hasToken: !!getToken(remoteJid)
-                })
                 
-                // If asking about repos but no cache, suggest /repos first
                 const isRepoQuestion = /(?:repo|repositor)/i.test(textContent)
                 if (isRepoQuestion && cachedGithubRepos.length === 0 && getToken(remoteJid)) {
-                    const response = "I don't have your GitHub repositories cached yet. Use `/repos` first to load them, then I can help you with repository questions!"
+                    const response = "I don't have your GitHub repositories cached yet. Use `/repos` first to load them!"
                     await sock.sendMessage(remoteJid, { text: response })
                     addToHistory(remoteJid, 'assistant', response)
                     return
                 }
                 
                 const response = await chatWithRepoFunctions(remoteJid, textContent, history, cachedGithubRepos)
-                logger.info('AI response generated', { responseLength: response.length })
                 await sock.sendMessage(remoteJid, { text: response })
                 addToHistory(remoteJid, 'assistant', response)
             } else {
@@ -976,4 +1206,174 @@ Just chat with me naturally - I understand context!`
     } catch (error) {
         logger.error('Error handling message', { error })
     }
+}
+
+// Extract the core message handling logic to be reusable by audioHandler
+export async function processTextMessage(sock: WASocket, remoteJid: string, textContent: string, fromAudio: boolean = false) {
+    const prefix = fromAudio ? '🎤➡️ ' : ''
+    
+    // Add user message to history
+    addToHistory(remoteJid, 'user', textContent)
+
+    // Auto-detect GitHub token in any message
+    const detectedToken = detectGitHubToken(textContent)
+    if (detectedToken) {
+        logger.info('GitHub token detected', { tokenLength: detectedToken.length, tokenStart: detectedToken.substring(0, 10) })
+        saveToken(remoteJid, detectedToken)
+        logger.info('Token saved for user', { remoteJid })
+        const response = `${prefix}GitHub token detected and saved! You can now use repo commands.`
+        await sock.sendMessage(remoteJid, { text: response })
+        addToHistory(remoteJid, 'assistant', response)
+        return
+    }
+
+    // Handle /vibe command
+    if (textContent.startsWith('/vibe ')) {
+        const activeRepo = getActiveRepo(remoteJid)
+        if (!activeRepo) {
+            const response = `${prefix}No active repository. Use /repos to list or /clone to add repositories.`
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
+            return
+        }
+
+        const repoPath = activeRepo.localPath
+        const promptForJanito = textContent.replace('/vibe', '').trim()
+
+        if (!promptForJanito) {
+            const response = `${prefix}Please provide a prompt, e.g., /vibe Change the title to Hello World.`
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
+            return
+        }
+
+        logger.info(`Running janito for prompt: ${promptForJanito} on ${repoPath}`)
+        await sock.sendMessage(remoteJid, { text: `${prefix}Starting AI code editing...` })
+
+        try {
+            const result = await runJanitoWithProgress(sock, remoteJid, repoPath, promptForJanito)
+            
+            if (result.success) {
+                if (result.hasChanges) {
+                    userState[remoteJid] = { repoPath, waitingForCommit: true, lastPrompt: promptForJanito }
+                    
+                    const funnyCommitMessages = [
+                        `Done! Want me to commit this masterpiece?`,
+                        `All set! Should I save this work to git?`,
+                        `Task completed! Ready to commit these changes?`,
+                        `Boom! Code is ready. Commit time?`,
+                        `Mission accomplished! Shall we make it official with a commit?`
+                    ]
+                    const randomMessage = funnyCommitMessages[Math.floor(Math.random() * funnyCommitMessages.length)]
+                    
+                    await sock.sendMessage(remoteJid, { 
+                        text: `${prefix}${randomMessage} (yes/no)` 
+                    })
+                    addToHistory(remoteJid, 'assistant', `${prefix}${randomMessage} (yes/no)`)
+                } else {
+                    const noChangesMessages = [
+                        `Hmm, looks like everything was already perfect! No changes needed.`,
+                        `I checked the code but didn't find anything to change. You're all good!`,
+                        `Your code is already on point! Nothing to modify here.`,
+                        `Seems like the task was already done. No changes required!`,
+                        `Everything looks great as it is. No modifications needed.`
+                    ]
+                    const randomNoChangeMessage = noChangesMessages[Math.floor(Math.random() * noChangesMessages.length)]
+                    
+                    await sock.sendMessage(remoteJid, { text: `${prefix}${randomNoChangeMessage}` })
+                    addToHistory(remoteJid, 'assistant', `${prefix}${randomNoChangeMessage}`)
+                }
+            } else {
+                const errorMessages = [
+                    `Oops, ran into some trouble:`,
+                    `Hit a snag while working on that:`,
+                    `Something went wrong on my end:`,
+                    `Encountered an issue:`,
+                    `Had some difficulty with that request:`
+                ]
+                const randomErrorMessage = errorMessages[Math.floor(Math.random() * errorMessages.length)]
+                
+                const response = `${prefix}${randomErrorMessage}\n\n${result.output}`
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+            }
+        } catch (error) {
+            logger.error('Error running janito with progress:', error)
+            const response = `${prefix}Sorry, something unexpected happened while processing your request.`
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
+        }
+        return
+    }
+
+    // Handle other commands (repos, clone, etc.) - simplified version for audio
+    if (textContent.startsWith('/repos') || textContent.toLowerCase().includes('repositorios') || textContent.toLowerCase().includes('repos')) {
+        try {
+            const token = getToken(remoteJid)
+            if (!token) {
+                const response = `${prefix}You'll need to set up your GitHub token first. Try /auth <token>`
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+
+            const loadingMessages = [
+                `${prefix}Getting your repositories...`,
+                `${prefix}Fetching your GitHub repos...`,
+                `${prefix}Loading your projects...`,
+                `${prefix}Checking what you've got...`
+            ]
+            const randomLoadingMessage = loadingMessages[Math.floor(Math.random() * loadingMessages.length)]
+            
+            await sock.sendMessage(remoteJid, { text: randomLoadingMessage })
+            addToHistory(remoteJid, 'assistant', randomLoadingMessage)
+
+            const githubRepos = await fetchUserRepos(token)
+            const localRepos = listRepos(remoteJid)
+            
+            // Cache GitHub repos for context
+            githubReposCache[remoteJid] = githubRepos
+            
+            // Show repos with simple format
+            let response = `${prefix}Here's what you've got:\n\n`
+            githubRepos.slice(0, 10).forEach(repo => {
+                const isLocal = localRepos.some(local => local.repoUrl === repo.clone_url)
+                const localIcon = isLocal ? ' (local)' : ''
+                const privateIcon = repo.private ? '[private] ' : ''
+                const lang = repo.language ? ` [${repo.language}]` : ''
+                const activeIcon = isLocal && getActiveRepo(remoteJid)?.repoUrl === repo.clone_url ? ' ★' : ''
+                
+                response += `${privateIcon}${repo.name}${lang}${localIcon}${activeIcon}\n`
+            })
+            
+            const cloneables = githubRepos.filter(repo => 
+                !localRepos.some(local => local.repoUrl === repo.clone_url)
+            ).slice(0, 3)
+            
+            if (cloneables.length > 0) {
+                response += `\nWant to clone something? Try: "${cloneables[0].name}"`
+            }
+            
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
+        } catch (error) {
+            logger.error('Error fetching GitHub repos', error)
+            const response = `${prefix}Couldn't fetch your repos right now. Check your token maybe?`
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
+        }
+        return
+    }
+
+    // For other commands, fall back to AI or show suggestion
+    const helpfulMessages = [
+        `${prefix}I get that you want to: "${textContent}"`,
+        `${prefix}Understood: "${textContent}"`,
+        `${prefix}Got it: "${textContent}"`
+    ]
+    const randomHelpMessage = helpfulMessages[Math.floor(Math.random() * helpfulMessages.length)]
+    
+    const response = `${randomHelpMessage}\n\nNeed help? Try:\n• /repos - Your repositories\n• /vibe <task> - Edit code\n• /status - Current repo status`
+    await sock.sendMessage(remoteJid, { text: response })
+    addToHistory(remoteJid, 'assistant', response)
 }
