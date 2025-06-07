@@ -1,4 +1,4 @@
-#!/Users/ignaciogorriti/Documents/Programacion/Commeta/venv/bin/python3.10
+#!/Users/luz/Documents/Desarrollo/GitHub/wpp-hackathon/Commeta/venv/bin/python3.13
 # -*- coding: utf-8 -*-
 import re
 import sys
