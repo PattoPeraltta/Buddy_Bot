@@ -36,6 +36,45 @@ function detectGitHubToken(text: string): string | null {
     return match ? match[0] : null
 }
 
+async function generateCommitMessage(repoPath: string, userPrompt: string): Promise<string> {
+    return new Promise((resolve) => {
+        // Get git diff to understand changes
+        exec(`cd ${repoPath} && git diff --staged`, (err, stdout, stderr) => {
+            if (err || !stdout.trim()) {
+                // Fallback to generic message
+                resolve(`feat: ${userPrompt}`)
+                return
+            }
+            
+            const diff = stdout.trim()
+            let commitMessage = ''
+            
+            // Analyze diff to generate semantic commit message
+            if (diff.includes('package.json') || diff.includes('yarn.lock') || diff.includes('package-lock.json')) {
+                commitMessage = 'chore: update dependencies'
+            } else if (diff.includes('README') || diff.includes('.md')) {
+                commitMessage = 'docs: update documentation'
+            } else if (diff.includes('test') || diff.includes('.test.') || diff.includes('.spec.')) {
+                commitMessage = 'test: update tests'
+            } else if (diff.includes('.css') || diff.includes('.scss') || diff.includes('style')) {
+                commitMessage = 'style: update styling'
+            } else if (diff.includes('config') || diff.includes('.env') || diff.includes('settings')) {
+                commitMessage = 'config: update configuration'
+            } else if (diff.includes('+ ') && !diff.includes('- ')) {
+                commitMessage = `feat: ${userPrompt}`
+            } else if (diff.includes('- ') && diff.includes('+ ')) {
+                commitMessage = `refactor: ${userPrompt}`
+            } else if (diff.includes('fix') || diff.includes('bug') || userPrompt.toLowerCase().includes('fix')) {
+                commitMessage = `fix: ${userPrompt}`
+            } else {
+                commitMessage = `feat: ${userPrompt}`
+            }
+            
+            resolve(commitMessage)
+        })
+    })
+}
+
 export function setupMessageHandler(sock: WASocket) {
     // Handle incoming messages
     sock.ev.on(
@@ -112,7 +151,10 @@ I can help you manage GitHub repositories via WhatsApp!
 • \`/auth <token>\` - Save GitHub token
 • \`/repos\` - List your GitHub repositories  
 • \`/clone <url>\` - Clone repository
-• \`/use <number>\` - Switch active repository
+• \`/use <repo-name>\` - Switch active repository
+• \`/local\` - List only local cloned repositories
+• \`/vibe <prompt>\` - Edit code with AI (e.g., /vibe add login form)
+• \`/status\` - Show current repo and git status
 • \`/help\` - Show this help
 
 *What I can do:*
@@ -122,12 +164,16 @@ I can help you manage GitHub repositories via WhatsApp!
 ✅ Commit and push changes automatically
 ✅ Switch between multiple projects
 ✅ Answer programming questions
+✅ Generate intelligent commit messages
+✅ Prevent duplicate cloning
+✅ Track git status and changes
 
 *Getting started:*
 1. Send me your GitHub token or use \`/auth <token>\`
 2. Use \`/repos\` to see your repositories
 3. Say "clone X repo" or use \`/clone <url>\`
-4. Start coding! 🚀
+4. Use \`/vibe <what you want>\` to edit code
+5. Commit with intelligent messages! 
 
 Just chat with me naturally - I understand context!`
             await sock.sendMessage(remoteJid, { text: response })
@@ -186,7 +232,19 @@ Just chat with me naturally - I understand context!`
                 // Cache GitHub repos for context
                 githubReposCache[remoteJid] = githubRepos
                 
-                const response = formatRepoList(githubRepos, localRepos)
+                // Show repos with simple format
+                let response = `📚 *Your GitHub Repositories:*\n\n`
+                githubRepos.slice(0, 20).forEach(repo => {
+                    const isLocal = localRepos.some(local => local.repoUrl === repo.clone_url)
+                    const localIcon = isLocal ? '📁' : ''
+                    const privateIcon = repo.private ? '🔒' : '🌐'
+                    const lang = repo.language ? `[${repo.language}]` : ''
+                    const activeIcon = isLocal && getActiveRepo(remoteJid)?.repoUrl === repo.clone_url ? ' ⭐' : ''
+                    
+                    response += `${privateIcon} ${repo.name} ${lang} ${localIcon}${activeIcon}\n`
+                })
+                response += `\n💡 Use "/use repo-name" to switch or "clone repo-name" to clone!`
+                
                 await sock.sendMessage(remoteJid, { text: response })
                 addToHistory(remoteJid, 'assistant', response)
             } catch (error) {
@@ -202,16 +260,47 @@ Just chat with me naturally - I understand context!`
 
         // 0c. Change active repo
         if (textContent.startsWith('/use ')) {
-            const numStr = textContent.split(' ')[1]
-            const idx = parseInt(numStr, 10)
+            const repoName = textContent.split(' ').slice(1).join(' ').trim()
             const repos = listRepos(remoteJid)
             let response: string
-            if (isNaN(idx) || idx < 1 || idx > repos.length) {
-                response = 'Usage: /use <repo_number> (see /repos)'
+            
+            if (!repoName) {
+                response = 'Usage: /use <repo-name>\n\nExample: /use my-awesome-project'
             } else {
-                const repo = repos[idx - 1]
-                setActiveRepo(remoteJid, repo.id)
-                response = `Active repo set to: ${repo.repoUrl}`
+                // Find repo by name (extract repo name from URL)
+                const foundRepo = repos.find(repo => {
+                    const urlParts = repo.repoUrl.split('/')
+                    const repoNameFromUrl = urlParts[urlParts.length - 1].replace('.git', '')
+                    return repoNameFromUrl.toLowerCase() === repoName.toLowerCase()
+                })
+                
+                if (foundRepo) {
+                    setActiveRepo(remoteJid, foundRepo.id)
+                    const repoNameClean = foundRepo.repoUrl.split('/').pop()?.replace('.git', '') || 'repo'
+                    response = `✅ Active repo set to: ${repoNameClean}`
+                } else {
+                    response = `❌ Repository "${repoName}" not found in your cloned repos.\n\nUse /repos to see available repositories.`
+                }
+            }
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
+            return
+        }
+
+        // List local repos only
+        if (textContent.startsWith('/local')) {
+            const repos = listRepos(remoteJid)
+            let response: string
+            if (repos.length === 0) {
+                response = 'No repositories cloned locally. Use /clone <url> or "clone repo-name" to get started.'
+            } else {
+                response = `📁 *Local Repositories:*\n\n`
+                repos.forEach(repo => {
+                    const repoName = repo.repoUrl.split('/').pop()?.replace('.git', '') || 'unknown'
+                    const activeIcon = getActiveRepo(remoteJid)?.id === repo.id ? ' ⭐' : ''
+                    response += `${repoName}${activeIcon}\n`
+                })
+                response += `\n💡 Use "/use repo-name" to switch active repository!`
             }
             await sock.sendMessage(remoteJid, { text: response })
             addToHistory(remoteJid, 'assistant', response)
@@ -221,6 +310,17 @@ Just chat with me naturally - I understand context!`
         // 1. Clone flow
         if (textContent.startsWith('/clone ')) {
             const repoUrl = textContent.split(' ')[1]
+            
+            // Check if repo is already cloned
+            const existingRepo = listRepos(remoteJid).find(r => r.repoUrl === repoUrl)
+            if (existingRepo) {
+                const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repository'
+                const response = `📁 Repository already cloned!\n\nUse "/use ${repoName}" to switch to it or /vibe to edit.`
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+            
             const repoId = Date.now()
             const localPath = `./repos/${repoId}`
 
@@ -276,80 +376,20 @@ Just chat with me naturally - I understand context!`
 
             const janitoCmd = `cd ${repoPath} && janito "${promptForJanito.replace(/"/g, '\\"')}"`;
             logger.info(`Running: ${janitoCmd}`)
+            exec(janitoCmd, async (err, stdout, stderr) => {
+                logger.info('Janito /vibe result', { err, stdout, stderr })
+                let msg = '';
+                if (err) msg += `❌ Janito error:\n${err}\n\n`;
+                if (stderr) msg += `⚠️ STDERR:\n${stderr}\n\n`;
+                if (stdout) msg += `✅ STDOUT:\n${stdout}\n\n`;
+                if (!msg) msg = 'No output from Janito.';
 
-            // Create a child process with stdio set to pipe
-            const { spawn } = require('child_process');
-            const [cmd, ...args] = janitoCmd.split(' ');
-            const janitoProcess = spawn(cmd, args, { shell: true });
+                userState[remoteJid].waitingForCommit = true;
+                userState[remoteJid].lastPrompt = promptForJanito; // Store for commit message
 
-            let currentSection = '';
-            let buffer = '';
-
-            // Handle stdout data
-            janitoProcess.stdout.on('data', async (data) => {
-                const output = data.toString();
-                buffer += output;
-
-                // Check for section headers
-                const sections = ['Implementation plan:', 'Discovery:', 'Description:', 'Implementation:', 'Validation:'];
-                for (const section of sections) {
-                    if (output.includes(section)) {
-                        // If we have buffered content from previous section, send it
-                        if (buffer && currentSection) {
-                            await sock.sendMessage(remoteJid, { 
-                                text: `📝 *${currentSection}*\n${buffer.trim()}`
-                            });
-                            buffer = '';
-                        }
-                        currentSection = section;
-                        break;
-                    }
-                }
-
-                // If we have a complete line, send it
-                if (buffer.includes('\n')) {
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop() || ''; // Keep the last incomplete line in buffer
-                    
-                    for (const line of lines) {
-                        if (line.trim()) {
-                            await sock.sendMessage(remoteJid, { 
-                                text: `📝 *${currentSection || 'Progress'}*\n${line.trim()}`
-                            });
-                        }
-                    }
-                }
-            });
-
-            // Handle stderr data
-            janitoProcess.stderr.on('data', async (data) => {
-                const error = data.toString();
-                if (error.trim()) {
-                    await sock.sendMessage(remoteJid, { 
-                        text: `⚠️ *Error*\n${error.trim()}`
-                    });
-                }
-            });
-
-            // Handle process completion
-            janitoProcess.on('close', async (code) => {
-                // Send any remaining buffered content
-                if (buffer.trim()) {
-                    await sock.sendMessage(remoteJid, { 
-                        text: `📝 *${currentSection || 'Final Output'}*\n${buffer.trim()}`
-                    });
-                }
-
-                if (code === 0) {
-                    userState[remoteJid].waitingForCommit = true;
-                    await sock.sendMessage(remoteJid, { 
-                        text: "✅ Janito process completed!\n\nDo you want me to commit these changes? (yes/no)"
-                    });
-                } else {
-                    await sock.sendMessage(remoteJid, { 
-                        text: `❌ Janito process exited with code ${code}`
-                    });
-                }
+                await sock.sendMessage(remoteJid, { 
+                    text: `Changes done!\n\n${msg}\nDo you want me to commit? (yes/no)` 
+                });
             });
 
             return;
@@ -359,9 +399,15 @@ Just chat with me naturally - I understand context!`
         if (userState[remoteJid]?.waitingForCommit) {
             if (/^(yes|commit)/i.test(textContent.trim())) {
                 const repoPath = userState[remoteJid].repoPath
+                const lastPrompt = userState[remoteJid].lastPrompt || 'AI-generated changes'
                 const git = simpleGit(repoPath)
                 await git.add('.')
-                await git.commit('Applied AI code changes')
+                
+                // Generate intelligent commit message
+                const commitMessage = await generateCommitMessage(repoPath, lastPrompt)
+                logger.info('Generated commit message', { commitMessage, prompt: lastPrompt })
+                await git.commit(commitMessage)
+                
                 // Push if we have a stored token
                 try {
                     const token = getToken(remoteJid)
@@ -373,17 +419,17 @@ Just chat with me naturally - I understand context!`
                         await git.push('origin', 'HEAD')
                         // Restore original URL without the token for safety
                         await git.remote(['set-url', 'origin', originUrl])
-                        const response = 'Changes pushed to GitHub! 🚀'
+                        const response = `✅ Changes committed and pushed to GitHub!\n\nCommit: ${commitMessage} 🚀`
                         await sock.sendMessage(remoteJid, { text: response })
                         addToHistory(remoteJid, 'assistant', response)
                     } else {
-                        const response = 'Commit saved locally. Configure a GitHub token with /auth to enable pushing.'
+                        const response = `✅ Changes committed locally!\n\nCommit: ${commitMessage}\n\nConfigure a GitHub token with /auth to enable pushing.`
                         await sock.sendMessage(remoteJid, { text: response })
                         addToHistory(remoteJid, 'assistant', response)
                     }
                 } catch (pushErr) {
                     logger.error('Git push failed', pushErr)
-                    const response = `Commit saved, but push failed: ${pushErr}`
+                    const response = `✅ Committed: ${commitMessage}\n\n❌ Push failed: ${pushErr}`
                     await sock.sendMessage(remoteJid, { text: response })
                     addToHistory(remoteJid, 'assistant', response)
                 }
@@ -394,6 +440,45 @@ Just chat with me naturally - I understand context!`
                 await sock.sendMessage(remoteJid, { text: response })
                 addToHistory(remoteJid, 'assistant', response)
             }
+            return
+        }
+
+        // Status command - show current repo and git status
+        if (textContent.startsWith('/status')) {
+            const activeRepo = getActiveRepo(remoteJid)
+            if (!activeRepo) {
+                const response = '❌ No active repository. Use /repos to list or /clone to add repositories.'
+                await sock.sendMessage(remoteJid, { text: response })
+                addToHistory(remoteJid, 'assistant', response)
+                return
+            }
+            
+            // Get git status
+            exec(`cd ${activeRepo.localPath} && git status --porcelain`, (err, stdout, stderr) => {
+                const repoName = activeRepo.repoUrl.split('/').pop()?.replace('.git', '') || 'unknown'
+                let statusMsg = `📁 *Active Repository:* ${repoName}\n\n`
+                
+                if (err) {
+                    statusMsg += '❌ Error getting git status'
+                } else if (!stdout.trim()) {
+                    statusMsg += '✅ Working directory clean'
+                } else {
+                    const changes = stdout.trim().split('\n')
+                    statusMsg += `📝 *Changes (${changes.length}):*\n`
+                    changes.slice(0, 10).forEach(change => {
+                        const status = change.substring(0, 2)
+                        const file = change.substring(3)
+                        const icon = status.includes('M') ? '📝' : status.includes('A') ? '➕' : status.includes('D') ? '➖' : '❓'
+                        statusMsg += `${icon} ${file}\n`
+                    })
+                    if (changes.length > 10) {
+                        statusMsg += `... and ${changes.length - 10} more files\n`
+                    }
+                }
+                
+                sock.sendMessage(remoteJid, { text: statusMsg })
+                addToHistory(remoteJid, 'assistant', statusMsg)
+            })
             return
         }
 
@@ -413,6 +498,15 @@ Just chat with me naturally - I understand context!`
                 if (cachedRepos && cachedRepos.length > 0) {
                     const foundRepo = findRepoByName(cachedRepos, repoName)
                     if (foundRepo) {
+                        // Check if repo is already cloned
+                        const existingRepo = listRepos(remoteJid).find(r => r.repoUrl === foundRepo.clone_url)
+                        if (existingRepo) {
+                            const response = `📁 Repository "${foundRepo.name}" already cloned!\n\nUse "/use ${foundRepo.name}" to switch to it or /vibe to edit.`
+                            await sock.sendMessage(remoteJid, { text: response })
+                            addToHistory(remoteJid, 'assistant', response)
+                            return
+                        }
+                        
                         // Use the found repo's clone URL
                         const repoId = Date.now()
                         const localPath = `./repos/${repoId}`
