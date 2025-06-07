@@ -121,3 +121,5 @@ Thumbs.db
 *.session
 qr.png
 qr_code.png
+
+*.bak

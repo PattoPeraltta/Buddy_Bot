@@ -2,74 +2,19 @@
   "users": [
     {
       "phone": "5491132986313@s.whatsapp.net",
-      "tokenEnc": "f5e0d2f4aac4c5562ac4a9c1bf0b1bb1:9104d753e10fc61585bb29068ab7f3b0a26e84d941b3f6531353161f0a042f19ba32aed14b446ddc6ceb6d05cf83473c71b05de8a40cedbc1071864e0c577eb669af09810b346256c7a36df02afadd04c58d21a571db316eed87d19e08bce47d",
-      "createdAt": "2025-06-07T16:49:55.506Z",
-      "activeRepoId": 5
-    },
-    {
-      "phone": "5493764177993@s.whatsapp.net",
-      "tokenEnc": "46e9d09e9fde223ad1e8cf00d276bcf1:a72ac33b0f7b83aa6a42e5fb58dad2e9c0c31bcc7a46ff6350b9fb836191552294683de946b98877bd61e3c3e4a936db",
-      "createdAt": "2025-06-07T17:24:24.650Z",
-      "activeRepoId": 6
+      "tokenEnc": "2a4d3ab05b419871f151ed6b81f56f9a:e397f0847678f2e9e072288844d286b4e7b888c1358600cb9f36da37daf3c2033990d21adc73930c99dafb58c69d0892c01102848a7a0ab09359b20f0fe9776bbe0ba56233a7e69ac4e240a3c04863545cdde38b02e5c45f11b2bd427e3a79a1",
+      "createdAt": "2025-06-07T19:56:28.533Z",
+      "activeRepoId": 1
     }
   ],
   "repos": [
     {
       "id": 1,
       "phone": "5491132986313@s.whatsapp.net",
-      "repoUrl": "https://github.com/igorriti/Fulvo.git",
-      "localPath": "./repos/1749315024766",
-      "createdAt": "2025-06-07T16:50:28.249Z"
-    },
-    {
-      "id": 2,
-      "phone": "5491132986313@s.whatsapp.net",
-      "repoUrl": "https://github.com/PattoPeraltta/Proyecto2_DataViz.git",
-      "localPath": "./repos/1749315918159",
-      "createdAt": "2025-06-07T17:05:46.114Z"
-    },
-    {
-      "id": 3,
-      "phone": "5491132986313@s.whatsapp.net",
-      "repoUrl": "https://github.com/PattoPeraltta/Proyecto2_DataViz.git",
-      "localPath": "./repos/1749316266383",
-      "createdAt": "2025-06-07T17:11:33.765Z"
-    },
-    {
-      "id": 4,
-      "phone": "5493764177993@s.whatsapp.net",
-      "repoUrl": "https://github.com/luzalbaposse/environmental-economics.git",
-      "localPath": "./repos/1749317378632",
-      "createdAt": "2025-06-07T17:29:39.170Z"
-    },
-    {
-      "id": 5,
-      "phone": "5491132986313@s.whatsapp.net",
-      "repoUrl": "https://github.com/PattoPeraltta/Pesca_Ilegal_DataViz.git",
-      "localPath": "./repos/1749317807676",
-      "createdAt": "2025-06-07T17:37:02.714Z"
-    },
-    {
-      "id": 5,
-      "phone": "5493764177993@s.whatsapp.net",
-      "repoUrl": "https://github.com/LIA-DiTella/converter.git",
-      "localPath": "./repos/1749318164477",
-      "createdAt": "2025-06-07T17:42:45.340Z"
-    },
-    {
-      "id": 6,
-      "phone": "5493764177993@s.whatsapp.net",
-      "repoUrl": "https://github.com/LIA-DiTella/converter.git",
-      "localPath": "./repos/1749318251209",
-      "createdAt": "2025-06-07T17:44:12.194Z"
-    },
-    {
-      "id": 6,
-      "phone": "5493764177993@s.whatsapp.net",
-      "repoUrl": "https://github.com/LIA-DiTella/visdecode.git",
-      "localPath": "./repos/1749318579398",
-      "createdAt": "2025-06-07T17:49:58.839Z"
+      "repoUrl": "https://github.com/PattoPeraltta/PattoPeraltta.git",
+      "localPath": "./repos/1749326237753",
+      "createdAt": "2025-06-07T19:57:18.521Z"
     }
   ],
-  "nextRepoId": 7
+  "nextRepoId": 2
 }
