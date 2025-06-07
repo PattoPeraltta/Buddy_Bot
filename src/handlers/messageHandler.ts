@@ -521,18 +521,25 @@ Just chat with me naturally - I understand context!`
                     // Get GitHub token and push if available
                     const token = getToken(remoteJid)
                     if (token) {
-                        const remotes = await git.getRemotes(true)
-                        const originUrl = remotes.find(r => r.name === 'origin')?.refs?.fetch
-                        if (originUrl) {
-                            const tokenUrl = originUrl.replace('https://', `https://${token}@`)
-                            await git.remote(['set-url', 'origin', tokenUrl])
-                            await git.push('origin', 'HEAD')
-                            // Restore original URL without the token for safety
-                            await git.remote(['set-url', 'origin', originUrl])
-                        }
-                        const response = `✅ Changes committed and pushed to GitHub!\n\nCommit: ${commitMessage} 🚀`
-                        await sock.sendMessage(remoteJid, { text: response })
-                        addToHistory(remoteJid, 'assistant', response)
+                        const originUrlRes = await git.remote(['get-url', 'origin'])
+                        const originUrl = (originUrlRes ?? '').toString().trim()
+                        const tokenUrl = originUrl.replace('https://', `https://${token}@`)
+                        await git.remote(['set-url', 'origin', tokenUrl])
+                        await git.push('origin', 'HEAD')
+                        // Restore original URL without the token for safety
+                        await git.remote(['set-url', 'origin', originUrl])
+                        
+                        const successMessages = [
+                            `Sweet! Committed and pushed: "${commitMessage}" 🚀`,
+                            `All done! Pushed with: "${commitMessage}" ✨`,
+                            `Perfect! Your changes are live: "${commitMessage}" 🎉`,
+                            `Boom! Code is on GitHub: "${commitMessage}" 💥`,
+                            `Nice! Everything's pushed: "${commitMessage}" 🔥`
+                        ]
+                        const randomSuccess = successMessages[Math.floor(Math.random() * successMessages.length)]
+                        
+                        await sock.sendMessage(remoteJid, { text: randomSuccess })
+                        addToHistory(remoteJid, 'assistant', randomSuccess)
                         
                         // Ask if they want to deploy to Vercel
                         if (isVercelCliInstalled()) {
