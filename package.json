@@ -24,11 +24,13 @@
     "license": "MIT",
     "dependencies": {
         "@hapi/boom": "^10.0.1",
+        "axios": "^1.9.0",
         "baileys": "^6.7.18",
         "dotenv": "^16.5.0",
         "express": "^4.19.2",
         "express-handlebars": "^7.0.7",
         "express-session": "^1.17.3",
+        "lowdb": "^6.1.1",
         "openai": "^4.37.0",
         "pino": "^8.19.0",
         "pino-pretty": "^10.3.1",
