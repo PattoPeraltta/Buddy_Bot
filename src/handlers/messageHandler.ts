@@ -155,6 +155,7 @@ I can help you manage GitHub repositories via WhatsApp!
 • \`/local\` - List only local cloned repositories
 • \`/vibe <prompt>\` - Edit code with AI (e.g., /vibe add login form)
 • \`/status\` - Show current repo and git status
+• \`/current\` or \`/active\` - Show current active repository
 • \`/help\` - Show this help
 
 *What I can do:*
@@ -262,24 +263,50 @@ Just chat with me naturally - I understand context!`
         if (textContent.startsWith('/use ')) {
             const repoName = textContent.split(' ').slice(1).join(' ').trim()
             const repos = listRepos(remoteJid)
+            logger.info('Use command called', { repoName, availableRepos: repos.length })
             let response: string
             
             if (!repoName) {
-                response = 'Usage: /use <repo-name>\n\nExample: /use my-awesome-project'
+                if (repos.length === 0) {
+                    response = '❌ No repositories cloned yet.\n\nUse "/clone <url>" or "clone repo-name" to get started.'
+                } else {
+                    response = `📁 *Available Local Repositories:*\n\n`
+                    repos.forEach((repo, idx) => {
+                        const repoName = repo.repoUrl.split('/').pop()?.replace('.git', '')
+                        const activeIcon = getActiveRepo(remoteJid)?.id === repo.id ? ' ⭐ (active)' : ''
+                        response += `• ${repoName}${activeIcon}\n`
+                    })
+                    response += `\n💡 Use "/use <repo-name>" to switch!\nExample: /use ${repos[0].repoUrl.split('/').pop()?.replace('.git', '') || 'repo-name'}`
+                }
             } else {
                 // Find repo by name (extract repo name from URL)
+                logger.info('Searching for repo', { searchName: repoName, repos: repos.map(r => ({
+                    id: r.id,
+                    url: r.repoUrl,
+                    extractedName: r.repoUrl.split('/').pop()?.replace('.git', '')
+                }))})
+                
                 const foundRepo = repos.find(repo => {
                     const urlParts = repo.repoUrl.split('/')
                     const repoNameFromUrl = urlParts[urlParts.length - 1].replace('.git', '')
-                    return repoNameFromUrl.toLowerCase() === repoName.toLowerCase()
+                    logger.info('Comparing names', { 
+                        searchName: repoName.toLowerCase(), 
+                        repoName: repoNameFromUrl.toLowerCase(),
+                        matches: repoNameFromUrl.toLowerCase() === repoName.toLowerCase() ||
+                               repoNameFromUrl.toLowerCase().includes(repoName.toLowerCase())
+                    })
+                    return repoNameFromUrl.toLowerCase() === repoName.toLowerCase() ||
+                           repoNameFromUrl.toLowerCase().includes(repoName.toLowerCase())
                 })
                 
                 if (foundRepo) {
                     setActiveRepo(remoteJid, foundRepo.id)
                     const repoNameClean = foundRepo.repoUrl.split('/').pop()?.replace('.git', '') || 'repo'
+                    logger.info('Active repo set', { repoId: foundRepo.id, repoName: repoNameClean })
                     response = `✅ Active repo set to: ${repoNameClean}`
                 } else {
-                    response = `❌ Repository "${repoName}" not found in your cloned repos.\n\nUse /repos to see available repositories.`
+                    const availableNames = repos.map(r => r.repoUrl.split('/').pop()?.replace('.git', '')).join(', ')
+                    response = `❌ Repository "${repoName}" not found.\n\nAvailable repos: ${availableNames}\n\nUse "/use" to see all options.`
                 }
             }
             await sock.sendMessage(remoteJid, { text: response })
@@ -336,12 +363,12 @@ Just chat with me naturally - I understand context!`
                             await sock.sendMessage(remoteJid, { text: response })
                             addToHistory(remoteJid, 'assistant', response)
                         } else {
-                            userState[remoteJid] = { repoPath: localPath, waitingForEdit: true }
                             // Build the rich message
                             const janitoDesc = stdout && stdout.trim().length > 0
                                 ? stdout.trim().substring(0, 2500) // Optional: limit length for WhatsApp
                                 : "(No description provided by Janito)"
-                            const response = `Repo cloned!\n\n${janitoDesc}\n\nWhat do you want to change? Please describe the change.`
+                            const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repository'
+                            const response = `✅ ${repoName} cloned and set as active!\n\n${janitoDesc}\n\nUse "/vibe <description>" to edit or "/status" to see git status.`
                             await sock.sendMessage(remoteJid, { text: response })
                             addToHistory(remoteJid, 'assistant', response)
                         }
@@ -357,13 +384,13 @@ Just chat with me naturally - I understand context!`
 
         // 2. If waiting for edit instruction
         if (textContent.startsWith('/vibe ')) {
-            const user = userState[remoteJid];
-            if (!user?.repoPath) {
-                await sock.sendMessage(remoteJid, { text: "No repo found for this conversation. Please /clone first." });
+            const activeRepo = getActiveRepo(remoteJid)
+            if (!activeRepo) {
+                await sock.sendMessage(remoteJid, { text: "❌ No active repository. Use /repos to list or /clone to add repositories." });
                 return;
             }
 
-            const repoPath = user.repoPath;
+            const repoPath = activeRepo.localPath;
             const promptForJanito = textContent.replace('/vibe', '').trim();
 
             if (!promptForJanito) {
@@ -384,8 +411,7 @@ Just chat with me naturally - I understand context!`
                 if (stdout) msg += `✅ STDOUT:\n${stdout}\n\n`;
                 if (!msg) msg = 'No output from Janito.';
 
-                userState[remoteJid].waitingForCommit = true;
-                userState[remoteJid].lastPrompt = promptForJanito; // Store for commit message
+                userState[remoteJid] = { repoPath, waitingForCommit: true, lastPrompt: promptForJanito }
 
                 await sock.sendMessage(remoteJid, { 
                     text: `Changes done!\n\n${msg}\nDo you want me to commit? (yes/no)` 
@@ -482,6 +508,28 @@ Just chat with me naturally - I understand context!`
             return
         }
 
+        // Show current active repo
+        if (textContent.startsWith('/current') || textContent.startsWith('/active')) {
+            const activeRepo = getActiveRepo(remoteJid)
+            let response: string
+            
+            if (!activeRepo) {
+                const repos = listRepos(remoteJid)
+                if (repos.length === 0) {
+                    response = '❌ No repositories cloned.\n\nUse "/clone <url>" or "clone repo-name" to get started.'
+                } else {
+                    response = '❌ No active repository set.\n\nUse "/use <repo-name>" to select one.'
+                }
+            } else {
+                const repoName = activeRepo.repoUrl.split('/').pop()?.replace('.git', '') || 'unknown'
+                response = `⭐ *Current Active Repository:*\n\n${repoName}\n\nUse "/status" for more details or "/use <name>" to switch.`
+            }
+            
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
+            return
+        }
+
         // Natural language clone detection (e.g., "clone myproject", "clona repo-name")
         const clonePatterns = [
             /(?:clone|clona|clonar)\s+([a-zA-Z0-9\-_.]+)/i,
@@ -524,11 +572,10 @@ Just chat with me naturally - I understand context!`
                                         await sock.sendMessage(remoteJid, { text: response })
                                         addToHistory(remoteJid, 'assistant', response)
                                     } else {
-                                        userState[remoteJid] = { repoPath: localPath, waitingForEdit: true }
                                         const janitoDesc = stdout && stdout.trim().length > 0
                                             ? stdout.trim().substring(0, 2500)
                                             : "(No description provided by Janito)"
-                                        const response = `✅ ${foundRepo.name} cloned successfully!\n\n${janitoDesc}\n\nWhat do you want to change? Please describe the change.`
+                                        const response = `✅ ${foundRepo.name} cloned and set as active!\n\n${janitoDesc}\n\nUse "/vibe <description>" to edit or "/status" to see git status.`
                                         await sock.sendMessage(remoteJid, { text: response })
                                         addToHistory(remoteJid, 'assistant', response)
                                     }
