@@ -51,7 +51,7 @@ export async function chatWithRepoFunctions(phone: string, prompt: string, histo
         }
     ]
 
-    const systemPrompt = `You are Commeta, an AI coding assistant that helps developers manage and edit Git repositories via WhatsApp.
+    const systemPrompt = `You are Buddy, an AI coding assistant that helps developers manage and edit Git repositories via WhatsApp.
 
  CONTEXT: You can help users with:
  - Managing GitHub repositories (clone, list, switch between repos)
@@ -192,7 +192,7 @@ SPECIAL HANDLING FOR CLONE REQUESTS:
 EXAMPLES:
 - "muéstrame mis repositorios" → command: "/repos"
 - "clona mi proyecto backend" → command: "clone backend" (if 'backend' repo exists)
-- "clona repo llamado commeta" → command: "clone commeta" (if 'commeta' repo exists)
+- "clona repo llamado buddy" → command: "clone buddy" (if 'buddy' repo exists)
 - "cambia el título a Hello World" → vibe: "change the title to Hello World"
 - "agrega un botón de login" → vibe: "add a login button"
 - "qué es React?" → general

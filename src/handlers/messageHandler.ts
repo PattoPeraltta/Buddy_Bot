@@ -3,9 +3,10 @@ import { BaileysEventMap, WASocket, WAMessage } from 'baileys'
 import { config } from '../config/index.js'
 import { generateResponse, chatWithRepoFunctions, synthesizeProgressMessage } from '../ai/openai.js'
 import { createLogger } from '../logger/index.js'
+import { exec, spawn } from 'child_process'
+import fetch from 'node-fetch'
 
 import simpleGit from 'simple-git'
-import { exec, execSync } from 'child_process'
 import { saveToken, addRepo, listRepos, getToken, setActiveRepo, getActiveRepo, saveVercelToken, getVercelToken } from '../db/index.js'
 import { fetchUserRepos, formatRepoList, findRepoByName } from '../utils/github.js'
 import { handleAudioMessage } from './audioHandler.js'
@@ -17,7 +18,10 @@ import {
     detectProjectType,
     generateVercelJson,
     validateVercelToken,
-    testVercelToken
+    testVercelToken,
+    isProjectDeployed,
+    isConnectedToGitHub,
+    deployToVercelWithGitHub
 } from '../utils/vercel.js'
 import fs from 'fs'
 import path from 'path'
@@ -56,8 +60,8 @@ async function generateCommitMessage(repoPath: string, userPrompt: string): Prom
         // Get git diff to understand changes
         exec(`cd ${repoPath} && git diff --staged`, (err, stdout, stderr) => {
             if (err || !stdout.trim()) {
-                // Fallback to generic message
-                resolve(`feat: ${userPrompt}`)
+                // Fallback to analyzing the prompt
+                resolve(generateCommitFromPrompt(userPrompt))
                 return
             }
             
@@ -76,18 +80,69 @@ async function generateCommitMessage(repoPath: string, userPrompt: string): Prom
             } else if (diff.includes('config') || diff.includes('.env') || diff.includes('settings')) {
                 commitMessage = 'config: update configuration'
             } else if (diff.includes('+ ') && !diff.includes('- ')) {
-                commitMessage = `feat: ${userPrompt}`
+                commitMessage = generateCommitFromPrompt(userPrompt, 'feat')
             } else if (diff.includes('- ') && diff.includes('+ ')) {
-                commitMessage = `refactor: ${userPrompt}`
+                commitMessage = generateCommitFromPrompt(userPrompt, 'refactor')
             } else if (diff.includes('fix') || diff.includes('bug') || userPrompt.toLowerCase().includes('fix')) {
-                commitMessage = `fix: ${userPrompt}`
+                commitMessage = generateCommitFromPrompt(userPrompt, 'fix')
             } else {
-                commitMessage = `feat: ${userPrompt}`
+                commitMessage = generateCommitFromPrompt(userPrompt)
             }
             
             resolve(commitMessage)
         })
     })
+}
+
+// Generate commit message from user prompt following conventional commits
+function generateCommitFromPrompt(prompt: string, suggestedType?: string): string {
+    const cleanPrompt = prompt.toLowerCase().trim()
+    
+    // Determine commit type based on keywords in prompt
+    let type = suggestedType || 'feat'
+    
+    if (cleanPrompt.includes('fix') || cleanPrompt.includes('bug') || cleanPrompt.includes('error')) {
+        type = 'fix'
+    } else if (cleanPrompt.includes('style') || cleanPrompt.includes('css') || cleanPrompt.includes('design') || cleanPrompt.includes('ui')) {
+        type = 'style'
+    } else if (cleanPrompt.includes('refactor') || cleanPrompt.includes('cleanup') || cleanPrompt.includes('improve')) {
+        type = 'refactor'
+    } else if (cleanPrompt.includes('test') || cleanPrompt.includes('spec')) {
+        type = 'test'
+    } else if (cleanPrompt.includes('doc') || cleanPrompt.includes('readme') || cleanPrompt.includes('comment')) {
+        type = 'docs'
+    } else if (cleanPrompt.includes('config') || cleanPrompt.includes('setting') || cleanPrompt.includes('env')) {
+        type = 'chore'
+    } else if (cleanPrompt.includes('add') || cleanPrompt.includes('create') || cleanPrompt.includes('new')) {
+        type = 'feat'
+    }
+    
+    // Clean and format the description
+    let description = prompt
+        .replace(/^(add|create|fix|update|refactor|improve|change|remove|delete)\s*/i, '')
+        .replace(/^(a|an|the)\s+/i, '')
+        .toLowerCase()
+        .trim()
+    
+    // Ensure description starts with a verb in imperative mood
+    if (!description.match(/^(add|create|fix|update|refactor|improve|change|remove|delete|implement|enhance)/)) {
+        if (type === 'feat') {
+            description = `add ${description}`
+        } else if (type === 'fix') {
+            description = `fix ${description}`
+        } else if (type === 'style') {
+            description = `update ${description}`
+        } else if (type === 'refactor') {
+            description = `refactor ${description}`
+        } else {
+            description = `update ${description}`
+        }
+    }
+    
+    // Limit description length and ensure it doesn't end with a period
+    description = description.substring(0, 50).replace(/\.$/, '')
+    
+    return `${type}: ${description}`
 }
 
 async function runJanitoWithProgress(
@@ -309,6 +364,34 @@ async function handleMessage(sock: WASocket, message: WAMessage) {
         // Add user message to history
         addToHistory(remoteJid, 'user', textContent)
 
+        // Greeting handler - show available commands when user says hello
+        if (textContent.toLowerCase().match(/^(hello|hi|hey|hola|good morning|good afternoon|good evening)$/i)) {
+            const response = `👋 Hello! I'm your AI coding assistant!
+
+Here's what I can help you with:
+
+🔧 **Getting Started:**
+• \`/auth <token>\` - Save your GitHub token
+• \`/repos\` - List your repositories
+• \`/help\` - Full command list
+
+🚀 **Quick Actions:**
+• \`/vibe <task>\` - Edit code with AI
+• \`/clone <url>\` - Clone a repository
+• \`/deploy\` - Deploy to Vercel
+
+💡 **Try saying:**
+• "Show my repos"
+• "Clone my-project"
+• "/vibe add a login form"
+
+Need your GitHub token? Get it here: https://github.com/settings/tokens`
+
+            await sock.sendMessage(remoteJid, { text: response })
+            addToHistory(remoteJid, 'assistant', response)
+            return
+        }
+
         // Auto-detect GitHub token in any message
         const detectedToken = detectGitHubToken(textContent)
         if (detectedToken) {
@@ -323,7 +406,7 @@ async function handleMessage(sock: WASocket, message: WAMessage) {
 
         // Help command
         if (textContent.startsWith('/help') || textContent.toLowerCase().includes('ayuda') || textContent.toLowerCase().includes('help')) {
-            const response = `🤖 *Commeta - AI Coding Assistant*
+            const response = `🤖 *buddy - AI Coding Assistant*
 
 I can help you manage GitHub repositories via WhatsApp!
 
@@ -601,6 +684,10 @@ Just chat with me naturally - I understand context!`
                 .then(async () => {
                     // Save repo association in DB
                     addRepo(remoteJid, repoUrl, localPath)
+                    
+                    // Detect if it's a web project
+                    const webDetection = detectWebProject(localPath)
+                    
                     // Index with janito and synthesize description
                     exec(`cd ${localPath} && janito describe`, async (err, stdout, stderr) => {
                         if (err) {
@@ -616,7 +703,19 @@ Just chat with me naturally - I understand context!`
                                 
                                 const synthesizedDesc = await synthesizeProgressMessage([rawDescription], 'janito_describe')
                                 const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repository'
-                                const response = `${repoName} is ready!\n\n${synthesizedDesc}\n\nTry "/vibe <task>" to start editing!`
+                                
+                                let response = `${repoName} is ready!\n\n${synthesizedDesc}`
+                                
+                                // Add web project suggestions
+                                if (webDetection.isWeb && webDetection.type && webDetection.suggestions) {
+                                    response += `\n\n🌐 **Detected ${webDetection.type} Project!**\n\n💡 Try these tasks:`
+                                    webDetection.suggestions.forEach(suggestion => {
+                                        response += `\n• /vibe ${suggestion}`
+                                    })
+                                    response += `\n\n🚀 Ready to deploy? Use /deploy when you're done!`
+                                } else {
+                                    response += `\n\nTry "/vibe <task>" to start editing!`
+                                }
                                 
                                 await sock.sendMessage(remoteJid, { text: response })
                                 addToHistory(remoteJid, 'assistant', response)
@@ -627,7 +726,14 @@ Just chat with me naturally - I understand context!`
                                     ? stdout.trim().substring(0, 1000)
                                     : "Repository ready to use"
                                 const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repository'
-                                const response = `${repoName} cloned and ready!\n\n${janitoDesc}\n\nUse "/vibe <task>" to edit!`
+                                let response = `${repoName} cloned and ready!\n\n${janitoDesc}`
+                                
+                                // Add web project suggestions even in fallback
+                                if (webDetection.isWeb && webDetection.type) {
+                                    response += `\n\n🌐 This looks like a ${webDetection.type} project! Try /vibe with web development tasks.`
+                                }
+                                response += `\n\nUse "/vibe <task>" to edit!`
+                                
                                 await sock.sendMessage(remoteJid, { text: response })
                                 addToHistory(remoteJid, 'assistant', response)
                             }
@@ -722,12 +828,31 @@ Just chat with me naturally - I understand context!`
         if (userState[remoteJid]?.waitingForCommit) {
             const { repoPath, lastPrompt } = userState[remoteJid]
             const git = simpleGit(repoPath)
+            const activeRepo = getActiveRepo(remoteJid) // Get active repo for deployment
 
             if (textContent.toLowerCase().includes('yes') || textContent.toLowerCase().includes('y')) {
-                // Auto-generate commit message with AI
-                const commitMessage = `AI: ${lastPrompt}`
+                // Send diff image before committing
+                await sock.sendMessage(remoteJid, { text: '📷 Generating diff preview...' })
+                
+                const imageSent = await sendDiffImage(sock, remoteJid, repoPath)
+                if (!imageSent) {
+                    // If image generation fails, continue with commit anyway
+                    await sock.sendMessage(remoteJid, { text: '⚠️ Could not generate diff image, but proceeding with commit...' })
+                }
+                
+                // Generate proper commit message with AI
+                const commitMessage = await generateCommitMessage(repoPath, lastPrompt)
 
                 try {
+                    // Configure git user as Call Buddy
+                    await git.addConfig('user.name', 'Call Buddy')
+                    await git.addConfig('user.email', 'callbuddy@yourdomain.com')
+                    
+                    // Clean up .bak files before adding
+                    exec(`find ${repoPath} -name "*.bak" -delete`, (err) => {
+                        if (err) logger.warn('Error deleting .bak files:', err)
+                    })
+                    
                     await git.add('.')
                     await git.commit(commitMessage)
 
@@ -743,7 +868,7 @@ Just chat with me naturally - I understand context!`
                         await git.remote(['set-url', 'origin', originUrl])
                         
                         const successMessages = [
-                            `Sweet! Committed and pushed: "${commitMessage}" 🚀`,
+                            `Sweet! Committed and pushed by Call Buddy: "${commitMessage}" 🚀`,
                             `All done! Pushed with: "${commitMessage}" ✨`,
                             `Perfect! Your changes are live: "${commitMessage}" 🎉`,
                             `Boom! Code is on GitHub: "${commitMessage}" 💥`,
@@ -754,20 +879,61 @@ Just chat with me naturally - I understand context!`
                         await sock.sendMessage(remoteJid, { text: randomSuccess })
                         addToHistory(remoteJid, 'assistant', randomSuccess)
                         
-                        // Ask if they want to deploy to Vercel
+                        // Check if project is already deployed to Vercel before asking about deployment
                         if (isVercelCliInstalled()) {
-                            const deployPrompt = '🚀 Would you like to deploy to Vercel? Reply with "deploy" or "yes" to proceed.'
-                            await sock.sendMessage(remoteJid, { text: deployPrompt })
-                            addToHistory(remoteJid, 'assistant', deployPrompt)
+                            const vercelToken = getVercelToken(remoteJid)
                             
-                            // Set a flag to handle the next message as a deploy confirmation
-                            userState[remoteJid].waitingForDeployConfirm = true
+                            try {
+                                // Check if project is already deployed
+                                const isDeployed = await isProjectDeployed(repoPath, vercelToken || undefined)
+                                
+                                if (!isDeployed) {
+                                    // Only show deploy prompt if not already deployed
+                                    const deployPrompt = '🚀 Would you like to deploy this to Vercel? Reply with "deploy" or "yes" to proceed.'
+                                    await sock.sendMessage(remoteJid, { text: deployPrompt })
+                                    addToHistory(remoteJid, 'assistant', deployPrompt)
+                                    
+                                    // Set a flag to handle the next message as a deploy confirmation
+                                    userState[remoteJid].waitingForDeployConfirm = true
+                                } else {
+                                    // Project is already deployed, automatically redeploy with latest commit
+                                    const autoDeployMsg = '🚀 Auto-deploying latest changes to Vercel...'
+                                    await sock.sendMessage(remoteJid, { text: autoDeployMsg })
+                                    addToHistory(remoteJid, 'assistant', autoDeployMsg)
+                                    
+                                    // Automatically deploy with GitHub integration
+                                    try {
+                                        if (activeRepo) {
+                                            const result = await deployToVercelWithGitHub(repoPath, activeRepo.repoUrl, true, vercelToken || undefined)
+                                            await sock.sendMessage(remoteJid, { text: result.message })
+                                            addToHistory(remoteJid, 'assistant', result.message)
+                                        } else {
+                                            const errorMsg = '❌ Could not find active repository for deployment.'
+                                            await sock.sendMessage(remoteJid, { text: errorMsg })
+                                            addToHistory(remoteJid, 'assistant', errorMsg)
+                                        }
+                                    } catch (deployError) {
+                                        logger.error('Auto-deployment failed', deployError)
+                                        const errorMsg = '❌ Auto-deployment failed. You can try manually with /deploy command.'
+                                        await sock.sendMessage(remoteJid, { text: errorMsg })
+                                        addToHistory(remoteJid, 'assistant', errorMsg)
+                                    }
+                                }
+                            } catch (error) {
+                                logger.warn('Could not check deployment status, showing deploy prompt anyway', { error })
+                                // Fallback to showing deploy prompt if we can't check
+                                const deployPrompt = '🚀 Would you like to deploy to Vercel? Reply with "deploy" or "yes" to proceed.'
+                                await sock.sendMessage(remoteJid, { text: deployPrompt })
+                                addToHistory(remoteJid, 'assistant', deployPrompt)
+                                
+                                userState[remoteJid].waitingForDeployConfirm = true
+                            }
                         }
                     } else {
                         const localMessages = [
-                            `Committed locally: "${commitMessage}"\n\nSet up a GitHub token with /auth to push!`,
+                            `Committed locally by Call Buddy: "${commitMessage}"\n\nSet up a GitHub token with /auth to push!`,
                             `Saved your work: "${commitMessage}"\n\nAdd a token to push to GitHub.`,
-                            `Changes committed: "${commitMessage}"\n\nNeed a GitHub token to push this live.`
+                            `Changes committed by Call Buddy: "${commitMessage}"\n\nNeed a GitHub token to push this live.`
                         ]
                         const randomLocal = localMessages[Math.floor(Math.random() * localMessages.length)]
                         
@@ -776,7 +942,7 @@ Just chat with me naturally - I understand context!`
                     }
                 } catch (pushErr) {
                     logger.error('Git push failed', pushErr)
-                    const response = `Committed: "${commitMessage}"\n\nBut couldn't push - ${pushErr}`
+                    const response = `Committed by Call Buddy: "${commitMessage}"\n\nBut couldn't push - ${pushErr}`
                     await sock.sendMessage(remoteJid, { text: response })
                     addToHistory(remoteJid, 'assistant', response)
                 }
@@ -803,9 +969,13 @@ Just chat with me naturally - I understand context!`
             
             if (textContent.toLowerCase().includes('deploy') || textContent.toLowerCase().includes('yes') || textContent.toLowerCase().includes('y')) {
                 if (activeRepo) {
-                    await sock.sendMessage(remoteJid, { text: '🚀 Starting Vercel deployment...' })
+                    await sock.sendMessage(remoteJid, { text: '🚀 Starting GitHub-integrated Vercel deployment...' })
                     
-                    const result = await deployToVercel(activeRepo.localPath, true)
+                    // Get stored Vercel token
+                    const vercelToken = getVercelToken(remoteJid)
+                    
+                    // Use GitHub-integrated deployment
+                    const result = await deployToVercelWithGitHub(activeRepo.localPath, activeRepo.repoUrl, true, vercelToken || undefined)
                     await sock.sendMessage(remoteJid, { text: result.message })
                     addToHistory(remoteJid, 'assistant', result.message)
                 } else {
@@ -920,6 +1090,10 @@ Just chat with me naturally - I understand context!`
                         simpleGit().clone(foundRepo.clone_url, localPath)
                             .then(async () => {
                                 addRepo(remoteJid, foundRepo.clone_url, localPath)
+                                
+                                // Detect if it's a web project
+                                const webDetection = detectWebProject(localPath)
+                                
                                 exec(`cd ${localPath} && janito describe`, async (err, stdout, stderr) => {
                                     if (err) {
                                         const response = `Repo cloned but couldn't analyze it: ${stderr || err}`
@@ -932,7 +1106,18 @@ Just chat with me naturally - I understand context!`
                                                 : "Repository cloned successfully"
                                             
                                             const synthesizedDesc = await synthesizeProgressMessage([rawDescription], 'janito_describe')
-                                            const response = `${foundRepo.name} is ready!\n\n${synthesizedDesc}\n\nTry "/vibe <task>" to start editing!`
+                                            let response = `${foundRepo.name} is ready!\n\n${synthesizedDesc}`
+                                            
+                                            // Add web project suggestions
+                                            if (webDetection.isWeb && webDetection.type && webDetection.suggestions) {
+                                                response += `\n\n🌐 **Detected ${webDetection.type} Project!**\n\n💡 Try these tasks:`
+                                                webDetection.suggestions.forEach(suggestion => {
+                                                    response += `\n• /vibe ${suggestion}`
+                                                })
+                                                response += `\n\n🚀 Ready to deploy? Use /deploy when you're done!`
+                                            } else {
+                                                response += `\n\nTry "/vibe <task>" to start editing!`
+                                            }
                                             
                                             await sock.sendMessage(remoteJid, { text: response })
                                             addToHistory(remoteJid, 'assistant', response)
@@ -941,7 +1126,14 @@ Just chat with me naturally - I understand context!`
                                             const janitoDesc = stdout && stdout.trim().length > 0
                                                 ? stdout.trim().substring(0, 1000)
                                                 : "Repository ready to use"
-                                            const response = `${foundRepo.name} cloned and ready!\n\n${janitoDesc}\n\nUse "/vibe <task>" to edit!`
+                                            let response = `${foundRepo.name} cloned and ready!\n\n${janitoDesc}`
+                                            
+                                            // Add web project suggestions even in fallback
+                                            if (webDetection.isWeb && webDetection.type) {
+                                                response += `\n\n🌐 This looks like a ${webDetection.type} project! Try /vibe with web development tasks.`
+                                            }
+                                            response += `\n\nUse "/vibe <task>" to edit!`
+                                            
                                             await sock.sendMessage(remoteJid, { text: response })
                                             addToHistory(remoteJid, 'assistant', response)
                                         }
@@ -1017,9 +1209,9 @@ Just chat with me naturally - I understand context!`
                 await sock.sendMessage(remoteJid, { text: '⏳ **Still Building...**\n\nVercel is compiling your project.' })
             }, 60000)
 
-            // Deploy to Vercel using utility function with token
+            // Deploy to Vercel using GitHub integration
             try {
-                const result = await deployToVercel(repoPath, true, vercelToken || undefined)
+                const result = await deployToVercelWithGitHub(repoPath, activeRepo.repoUrl, true, vercelToken || undefined)
                 await sock.sendMessage(remoteJid, { text: result.message })
                 addToHistory(remoteJid, 'assistant', result.message)
             } catch (error) {
@@ -1133,8 +1325,8 @@ Just chat with me naturally - I understand context!`
             // Get stored Vercel token
             const vercelToken = getVercelToken(remoteJid)
 
-            // Deploy to Vercel as preview (not production) with token
-            const result = await deployToVercel(repoPath, false, vercelToken || undefined)
+            // Deploy to Vercel as preview (not production) with GitHub integration
+            const result = await deployToVercelWithGitHub(repoPath, activeRepo.repoUrl, false, vercelToken || undefined)
             await sock.sendMessage(remoteJid, { text: result.message })
             addToHistory(remoteJid, 'assistant', result.message)
             
@@ -1376,4 +1568,260 @@ export async function processTextMessage(sock: WASocket, remoteJid: string, text
     const response = `${randomHelpMessage}\n\nNeed help? Try:\n• /repos - Your repositories\n• /vibe <task> - Edit code\n• /status - Current repo status`
     await sock.sendMessage(remoteJid, { text: response })
     addToHistory(remoteJid, 'assistant', response)
+}
+
+// Function to detect if a repository is a web project
+function detectWebProject(repoPath: string): { isWeb: boolean, type?: string, suggestions?: string[] } {
+    try {
+        const files = fs.readdirSync(repoPath)
+        const hasFile = (filename: string) => files.some(f => f.toLowerCase() === filename.toLowerCase())
+        const hasFilePattern = (pattern: RegExp) => files.some(f => pattern.test(f))
+        
+        let isWeb = false
+        let type = ''
+        let suggestions: string[] = []
+        
+        // Check for common web project indicators
+        if (hasFile('package.json')) {
+            const packagePath = path.join(repoPath, 'package.json')
+            try {
+                const packageContent = JSON.parse(fs.readFileSync(packagePath, 'utf8'))
+                const deps = { ...packageContent.dependencies, ...packageContent.devDependencies }
+                
+                if (deps.react || deps['@types/react']) {
+                    isWeb = true
+                    type = 'React'
+                    suggestions = ['Add a new component', 'Update the styling', 'Add routing with React Router']
+                } else if (deps.vue || deps['@vue/cli']) {
+                    isWeb = true
+                    type = 'Vue.js'
+                    suggestions = ['Create a new Vue component', 'Add Vuex state management', 'Update the UI styling']
+                } else if (deps.angular || deps['@angular/core']) {
+                    isWeb = true
+                    type = 'Angular'
+                    suggestions = ['Generate a new component', 'Add a service', 'Update the template styling']
+                } else if (deps.next || deps['next']) {
+                    isWeb = true
+                    type = 'Next.js'
+                    suggestions = ['Add a new page', 'Create an API route', 'Update the homepage design']
+                } else if (deps.express || deps.fastify) {
+                    isWeb = true
+                    type = 'Node.js API'
+                    suggestions = ['Add a new API endpoint', 'Create middleware', 'Add database integration']
+                } else if (deps.gatsby) {
+                    isWeb = true
+                    type = 'Gatsby'
+                    suggestions = ['Add a new page', 'Create a blog post template', 'Update the site design']
+                }
+            } catch (e) {
+                // Fallback to generic Node.js detection
+                isWeb = true
+                type = 'Node.js'
+                suggestions = ['Add new functionality', 'Update dependencies', 'Improve the codebase']
+            }
+        }
+        
+        // Check for HTML/CSS files
+        if (!isWeb && (hasFilePattern(/\.html$/i) || hasFile('index.html'))) {
+            isWeb = true
+            type = 'Static Website'
+            suggestions = ['Update the homepage content', 'Add new pages', 'Improve the styling']
+        }
+        
+        // Check for common web frameworks
+        if (!isWeb && hasFile('composer.json')) {
+            isWeb = true
+            type = 'PHP/Laravel'
+            suggestions = ['Add a new route', 'Create a controller', 'Update the views']
+        }
+        
+        if (!isWeb && (hasFile('Gemfile') || hasFilePattern(/\.rb$/i))) {
+            isWeb = true
+            type = 'Ruby/Rails'
+            suggestions = ['Generate a new controller', 'Add a model', 'Update the routes']
+        }
+        
+        if (!isWeb && hasFile('requirements.txt') && hasFilePattern(/\.py$/i)) {
+            const files = fs.readdirSync(repoPath)
+            const hasDjango = files.some(f => f === 'manage.py')
+            const hasFlask = files.some(f => f.toLowerCase().includes('app.py'))
+            
+            if (hasDjango || hasFlask) {
+                isWeb = true
+                type = hasDjango ? 'Django' : 'Flask'
+                suggestions = ['Add a new view', 'Create a template', 'Update the models']
+            }
+        }
+        
+        return { isWeb, type, suggestions }
+    } catch (error) {
+        logger.error('Error detecting web project:', error)
+        return { isWeb: false }
+    }
+}
+
+// Function to get and synthesize git diff for image generation
+async function getSynthesizedDiff(repoPath: string): Promise<{ diff: string, language: string } | null> {
+    return new Promise((resolve) => {
+        // Get git diff (staged changes first, then unstaged if no staged changes)
+        exec(`cd ${repoPath} && git diff --staged`, (err, stagedDiff) => {
+            const diffToUse = stagedDiff.trim() || ''
+            
+            if (!diffToUse) {
+                // Check for unstaged changes
+                exec(`cd ${repoPath} && git diff`, (err2, unstagedDiff) => {
+                    if (!unstagedDiff.trim()) {
+                        resolve(null)
+                        return
+                    }
+                    
+                    processDiff(unstagedDiff.trim())
+                })
+                return
+            }
+            
+            processDiff(diffToUse)
+        })
+        
+        function processDiff(diff: string) {
+            try {
+                // Extract the main changes and detect language
+                const lines = diff.split('\n')
+                let language = 'javascript' // default
+                let mainChanges: string[] = []
+                let currentFile = ''
+                
+                // Detect language from file extensions
+                for (const line of lines) {
+                    if (line.startsWith('diff --git')) {
+                        const match = line.match(/diff --git a\/(.+) b\/(.+)/)
+                        if (match) {
+                            currentFile = match[2]
+                            const ext = path.extname(currentFile).toLowerCase()
+                            if (ext === '.ts' || ext === '.tsx') language = 'typescript'
+                            else if (ext === '.js' || ext === '.jsx') language = 'javascript'
+                            else if (ext === '.py') language = 'python'
+                            else if (ext === '.java') language = 'java'
+                            else if (ext === '.cpp' || ext === '.c') language = 'cpp'
+                            else if (ext === '.css') language = 'css'
+                            else if (ext === '.html') language = 'html'
+                            else if (ext === '.php') language = 'php'
+                            else if (ext === '.go') language = 'go'
+                            else if (ext === '.rs') language = 'rust'
+                        }
+                    }
+                    
+                    // Collect added/removed lines (the main changes)
+                    if (line.startsWith('+') && !line.startsWith('+++')) {
+                        mainChanges.push(line)
+                    } else if (line.startsWith('-') && !line.startsWith('---')) {
+                        mainChanges.push(line)
+                    }
+                }
+                
+                // If we have too many changes, synthesize to show the most important ones
+                if (mainChanges.length > 15) {
+                    // Take first 8 and last 7 changes to show context
+                    const synthesized = [
+                        ...mainChanges.slice(0, 8),
+                        '// ... more changes ...',
+                        ...mainChanges.slice(-7)
+                    ]
+                    mainChanges = synthesized
+                }
+                
+                // Add file context if we know the file
+                let finalDiff = ''
+                if (currentFile) {
+                    finalDiff += `// File: ${currentFile}\n`
+                }
+                
+                finalDiff += mainChanges.join('\n')
+                
+                resolve({ diff: finalDiff, language })
+            } catch (error) {
+                logger.error('Error processing diff:', error)
+                resolve(null)
+            }
+        }
+    })
+}
+
+// Function to generate diff image using localhost API
+async function generateDiffImage(diffContent: string, language: string): Promise<Buffer | null> {
+    try {
+        // Make the diff content more square by adding padding lines and formatting
+        const lines = diffContent.split('\n')
+        const maxWidth = Math.max(...lines.map(line => line.length))
+        
+        // Add some empty lines at the top and bottom to make it more square
+        const paddedLines = [
+            '',
+            '// 🚀 Code Changes Preview',
+            '',
+            ...lines,
+            '',
+            '// ✨ Generated by buddy AI',
+            ''
+        ]
+        
+        const squareContent = paddedLines.join('\n')
+        
+        // Use a cool pink gradient background and better styling
+        const apiUrl = new URL('http://localhost:3000/api/to-image')
+        apiUrl.searchParams.set('theme', 'synthwave84') // Cool retro theme
+        apiUrl.searchParams.set('language', language)
+        apiUrl.searchParams.set('line-numbers', 'true')
+        apiUrl.searchParams.set('scale', '3') // Higher quality
+        apiUrl.searchParams.set('padding', '12') // More padding for square look
+        apiUrl.searchParams.set('background-color', 'linear-gradient(135deg, #ff6ec7 0%, #ff9a9e 50%, #fad0c4 100%)') // Cool pink gradient
+        apiUrl.searchParams.set('show-background', 'true')
+        
+        const response = await fetch(apiUrl.toString(), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'text/plain'
+            },
+            body: squareContent
+        })
+        
+        if (!response.ok) {
+            logger.error('API response not ok', { status: response.status, statusText: response.statusText })
+            return null
+        }
+        
+        const buffer = await response.buffer()
+        return buffer
+    } catch (error) {
+        logger.error('Error calling code2img API', { error })
+        return null
+    }
+}
+
+// Function to send diff image to user
+async function sendDiffImage(sock: WASocket, remoteJid: string, repoPath: string): Promise<boolean> {
+    try {
+        const diffData = await getSynthesizedDiff(repoPath)
+        if (!diffData) {
+            logger.info('No diff changes found for image generation')
+            return false
+        }
+        
+        const imageBuffer = await generateDiffImage(diffData.diff, diffData.language)
+        if (!imageBuffer) {
+            logger.error('Failed to generate diff image', {})
+            return false
+        }
+        
+        // Send the image
+        await sock.sendMessage(remoteJid, {
+            image: imageBuffer,
+            caption: '📸 Here\'s what changed in this commit:'
+        })
+        
+        return true
+    } catch (error) {
+        logger.error('Error sending diff image', { error })
+        return false
+    }
 }

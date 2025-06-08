@@ -25,7 +25,7 @@ export async function fetchUserRepos(token: string): Promise<GitHubRepo[]> {
             headers: {
                 'Authorization': `Bearer ${token}`,
                 'Accept': 'application/vnd.github.v3+json',
-                'User-Agent': 'Commeta-Bot'
+                'User-Agent': 'buddy-Bot'
             },
             timeout: 10000
         })

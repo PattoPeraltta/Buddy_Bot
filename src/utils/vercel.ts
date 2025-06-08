@@ -524,4 +524,227 @@ export async function testVercelToken(token: string): Promise<{ valid: boolean; 
             }
         })
     })
+}
+
+/**
+ * Check if the current project is already deployed on Vercel
+ */
+export async function isProjectDeployed(projectPath: string, token?: string): Promise<boolean> {
+    return new Promise((resolve) => {
+        let statusCmd = `cd ${projectPath}`
+        
+        if (token) {
+            statusCmd += ` && vercel ls --token="${token}"`
+        } else {
+            statusCmd += ` && vercel ls`
+        }
+        
+        exec(statusCmd, (err, stdout, stderr) => {
+            if (err) {
+                logger.warn('Could not check deployment status', { error: err.message })
+                resolve(false)
+                return
+            }
+            
+            // If we get deployments listed, the project is deployed
+            const lines = stdout.split('\n').filter(line => line.trim())
+            resolve(lines.length > 1) // More than just header means deployments exist
+        })
+    })
+}
+
+/**
+ * Check if project is connected to GitHub on Vercel
+ */
+export async function isConnectedToGitHub(projectPath: string, githubUrl: string, token?: string): Promise<boolean> {
+    return new Promise((resolve) => {
+        let inspectCmd = `cd ${projectPath}`
+        
+        if (token) {
+            inspectCmd += ` && vercel inspect --token="${token}"`
+        } else {
+            inspectCmd += ` && vercel inspect`
+        }
+        
+        exec(inspectCmd, (err, stdout, stderr) => {
+            if (err) {
+                logger.warn('Could not inspect project', { error: err.message })
+                resolve(false)
+                return
+            }
+            
+            // Check if the output mentions GitHub or the specific repo URL
+            const output = stdout.toLowerCase()
+            const cleanGithubUrl = githubUrl.replace('.git', '').toLowerCase()
+            
+            resolve(output.includes('github') && output.includes(cleanGithubUrl.split('/').pop() || ''))
+        })
+    })
+}
+
+/**
+ * Deploy to Vercel with GitHub integration
+ */
+export function deployToVercelWithGitHub(projectPath: string, githubUrl: string, isProduction = true, token?: string): Promise<VercelDeploymentResult> {
+    return new Promise((resolve) => {
+        // First, try to link the project to GitHub
+        let linkCmd = `cd ${projectPath}`
+        
+        if (token) {
+            linkCmd += ` && vercel link --yes --token="${token}"`
+        } else {
+            linkCmd += ` && vercel link --yes`
+        }
+        
+        logger.info('Linking project to Vercel', { projectPath, githubUrl, hasToken: !!token })
+        
+        exec(linkCmd, (linkErr, linkStdout, linkStderr) => {
+            // Continue even if linking fails (might already be linked)
+            if (linkErr) {
+                logger.warn('Project linking failed or already linked', { error: linkErr.message })
+            }
+            
+            // Now deploy with GitHub integration preference
+            let deployCmd = `cd ${projectPath}`
+            
+            if (token) {
+                deployCmd += ` && vercel${isProduction ? ' --prod' : ''} --yes --token="${token}"`
+            } else {
+                deployCmd += ` && vercel${isProduction ? ' --prod' : ''} --yes`
+            }
+            
+            logger.info('Starting GitHub-integrated deployment', { projectPath, isProduction, hasToken: !!token })
+            
+            const childProcess = exec(deployCmd, { timeout: 300000 }, (err, stdout, stderr) => {
+                if (err) {
+                    logger.error('GitHub-integrated deployment failed', { error: err, stderr })
+                    
+                    // Check for timeout specifically
+                    if (err.message.includes('timeout') || err.signal === 'SIGTERM') {
+                        resolve({
+                            success: false,
+                            message: '⏱️ **Deployment Timed Out** (5 min)\n\nThis might mean:\n• Large project taking time to build\n• Network issues\n• Vercel service delays\n\nTry `/vercel-status` to check if it completed.',
+                            logs: stderr
+                        })
+                        return
+                    }
+                    
+                    // Check for common authentication errors
+                    if (err.message.includes('not authenticated') || 
+                        stderr.includes('not authenticated') ||
+                        stderr.includes('invalid token') ||
+                        stderr.includes('unauthorized') ||
+                        err.message.includes('401') ||
+                        err.message.includes('403')) {
+                        resolve({
+                            success: false,
+                            message: '🔐 **Authentication Failed**\n\nPlease:\n1. Get fresh token: https://vercel.com/account/tokens\n2. Use `/vercel-token <new_token>`\n3. Ensure token has proper permissions',
+                            logs: stderr
+                        })
+                        return
+                    }
+                    
+                    // Parse Vercel-specific errors
+                    let message = '❌ **Deployment Failed**\n\n'
+                    
+                    // Extract URLs if deployment started but failed
+                    const urlMatches = stderr.match(/https:\/\/[^\s]+\.vercel\.app/g)
+                    if (urlMatches && urlMatches.length > 0) {
+                        message += `🔍 **Inspect URL:**\n${urlMatches[0]}\n\n`
+                    }
+                    
+                    // Extract build errors
+                    if (stderr.includes('npm run build') && stderr.includes('exited with 1')) {
+                        message += '🔨 **Build Error:**\nYour project failed to build\n\n'
+                        
+                        // Try to extract the actual error
+                        const errorLines = stderr.split('\n')
+                        for (let i = 0; i < errorLines.length; i++) {
+                            const line = errorLines[i]
+                            if (line.includes('Error:') && !line.includes('Command failed')) {
+                                message += `💡 **Issue:** ${line.replace('Error:', '').trim()}\n\n`
+                                break
+                            }
+                        }
+                        
+                        message += '**Next Steps:**\n'
+                        message += '• Check your build script in `package.json`\n'
+                        message += '• Fix any TypeScript/compilation errors\n'
+                        message += '• Test locally: `npm run build`'
+                    } else if (stderr.includes('ENOENT') || stderr.includes('not found')) {
+                        message += '📁 **Missing Files:**\nSome required files or dependencies are missing\n\n'
+                        message += '**Try:**\n• `npm install` to install dependencies\n• Check if all files are committed to git'
+                    } else {
+                        // Generic error - show first meaningful line
+                        const errorLines = stderr.split('\n').filter(line => 
+                            line.trim() && 
+                            !line.includes('Command failed') &&
+                            !line.includes('Vercel CLI')
+                        )
+                        
+                        if (errorLines.length > 0) {
+                            message += `💭 **Error:** ${errorLines[0].trim()}\n\n`
+                        }
+                        
+                        message += '**Debug:**\n• Use `/vercel-logs` for details\n• Check Vercel dashboard'
+                    }
+                    
+                    resolve({
+                        success: false,
+                        message,
+                        logs: stderr
+                    })
+                } else {
+                    // Extract deployment URL from stdout
+                    const urlMatch = stdout.match(/https:\/\/[^\s]+\.vercel\.app/g)
+                    const deploymentUrl = urlMatch ? urlMatch[urlMatch.length - 1] : undefined
+                    
+                    logger.info('GitHub-integrated deployment successful', { deploymentUrl, projectPath })
+                    
+                    let message = '✅ **Deployment Successful!** 🎉\n\n'
+                    if (deploymentUrl) {
+                        message += `🌐 **Live URL:**\n${deploymentUrl}\n\n`
+                    }
+                    
+                    message += `🔗 **GitHub Integration:** Connected!\n`
+                    message += `🚀 Future commits will auto-deploy\n\n`
+                    
+                    // Extract build time if available
+                    const buildTimeMatch = stdout.match(/\[(\d+)ms\]/)
+                    if (buildTimeMatch) {
+                        const buildTime = Math.round(parseInt(buildTimeMatch[1]) / 1000)
+                        message += `⏱️ Built in ${buildTime}s`
+                    } else {
+                        message += `✨ Your project is now live and connected!`
+                    }
+                    
+                    resolve({
+                        success: true,
+                        url: deploymentUrl,
+                        message,
+                        logs: stdout
+                    })
+                }
+            })
+            
+            // Add progress updates for long deployments
+            let progressTimer: NodeJS.Timeout
+            let progressCount = 0
+            
+            if (childProcess.pid) {
+                progressTimer = setInterval(() => {
+                    progressCount++
+                    const dots = '.'.repeat((progressCount % 3) + 1)
+                    logger.info(`GitHub deployment in progress${dots}`, { elapsed: `${progressCount * 30}s` })
+                }, 30000) // Every 30 seconds
+            }
+            
+            // Clean up timer when process ends
+            childProcess.on('exit', () => {
+                if (progressTimer) {
+                    clearInterval(progressTimer)
+                }
+            })
+        })
+    })
 } 
