@@ -1,11 +1,9 @@
 import { BaileysEventMap, WASocket, WAMessage } from 'baileys'
-
 import { config } from '../config/index.js'
 import { generateResponse, chatWithRepoFunctions, synthesizeProgressMessage } from '../ai/openai.js'
 import { createLogger } from '../logger/index.js'
 import { exec, spawn } from 'child_process'
 import fetch from 'node-fetch'
-
 import simpleGit from 'simple-git'
 import { saveToken, addRepo, listRepos, getToken, setActiveRepo, getActiveRepo, saveVercelToken, getVercelToken } from '../db/index.js'
 import { fetchUserRepos, formatRepoList, findRepoByName } from '../utils/github.js'
@@ -295,21 +293,19 @@ async function generateProgressMessages(janitoOutput: string): Promise<string[]>
     return messages.slice(0, 3) // Ensure we only return 3 messages
 }
 
+// List of allowed phone numbers
+const ALLOWED_NUMBERS = [  
+    '5493764177993'   // +54 9 3764 17-7993
+]
+
 export function setupMessageHandler(sock: WASocket) {
-    // Handle incoming messages
     sock.ev.on(
         'messages.upsert',
         async ({ messages, type }: BaileysEventMap['messages.upsert']) => {
-            // Only process new messages
             if (type !== 'notify') return
-
             for (const message of messages) {
-                // Skip if no message content
                 if (!message.message) continue
-
-                // Skip messages from self
                 if (message.key.fromMe) continue
-
                 await handleMessage(sock, message)
             }
         }
@@ -326,6 +322,18 @@ async function handleMessage(sock: WASocket, message: WAMessage) {
         if (!remoteJid) return
         if (message.message?.audioMessage) {
             await handleAudioMessage(sock, message)
+            return
+        }
+
+        // Extract phone number from remoteJid (remove @s.whatsapp.net)
+        const phoneNumber = remoteJid.split('@')[0]
+        
+        // Check if the number is allowed
+        if (!ALLOWED_NUMBERS.includes(phoneNumber)) {
+            logger.info('Message received from unauthorized number', {
+                from: remoteJid,
+                messageId: message.key.id
+            })
             return
         }
 
@@ -678,10 +686,11 @@ Just chat with me naturally - I understand context!`
             
             const repoId = Date.now()
             const localPath = `./repos/${repoId}`
+            logger.info(`Cloning repo ${repoUrl} to ${localPath}`)
 
-            // Clone
             simpleGit().clone(repoUrl, localPath)
                 .then(async () => {
+
                     // Save repo association in DB
                     addRepo(remoteJid, repoUrl, localPath)
                     
@@ -689,7 +698,9 @@ Just chat with me naturally - I understand context!`
                     const webDetection = detectWebProject(localPath)
                     
                     // Index with janito and synthesize description
+
                     exec(`cd ${localPath} && janito describe`, async (err, stdout, stderr) => {
+                        logger.info('Janito describe after clone', { err, stdout, stderr })
                         if (err) {
                             const response = `Repo cloned but couldn't analyze it: ${stderr || err}`
                             await sock.sendMessage(remoteJid, { text: response })
@@ -737,6 +748,7 @@ Just chat with me naturally - I understand context!`
                                 await sock.sendMessage(remoteJid, { text: response })
                                 addToHistory(remoteJid, 'assistant', response)
                             }
+
                         }
                     })
                 })
@@ -747,6 +759,7 @@ Just chat with me naturally - I understand context!`
                 })
             return
         }
+
 
         // 2. If waiting for edit instruction
         if (textContent.startsWith('/vibe ')) {
@@ -820,11 +833,10 @@ Just chat with me naturally - I understand context!`
                 await sock.sendMessage(remoteJid, { text: response })
                 addToHistory(remoteJid, 'assistant', response)
             }
-
             return;
         }
 
-        // 3. If waiting for commit confirmation
+        // COMMIT
         if (userState[remoteJid]?.waitingForCommit) {
             const { repoPath, lastPrompt } = userState[remoteJid]
             const git = simpleGit(repoPath)
@@ -962,7 +974,6 @@ Just chat with me naturally - I understand context!`
             }
             return
         }
-
         // 4. If waiting for deploy confirmation
         if (userState[remoteJid]?.waitingForDeployConfirm) {
             const activeRepo = getActiveRepo(remoteJid)
@@ -1395,6 +1406,7 @@ Just chat with me naturally - I understand context!`
             await sock.sendMessage(remoteJid, { text: response })
             addToHistory(remoteJid, 'assistant', response)
         }
+
     } catch (error) {
         logger.error('Error handling message', { error })
     }
@@ -1795,6 +1807,7 @@ async function generateDiffImage(diffContent: string, language: string): Promise
     } catch (error) {
         logger.error('Error calling code2img API', { error })
         return null
+
     }
 }
 
