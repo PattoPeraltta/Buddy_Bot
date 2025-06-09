@@ -9,6 +9,7 @@ lib/
 build/
 *.tsbuildinfo
 repos/
+.janito/
 
 # Environment files
 .env
@@ -123,3 +124,4 @@ qr.png
 qr_code.png
 
 *.bak
+db.json
